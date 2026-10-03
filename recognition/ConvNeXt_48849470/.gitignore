@@ -1,0 +1,16 @@
+# data and weights, never commit these
+*.pt
+*.pth
+*.ckpt
+*.nii
+*.nii.gz
+data/
+
+# python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# slurm logs
+slurm-*.out
+*.log
