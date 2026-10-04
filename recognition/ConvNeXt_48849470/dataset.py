@@ -77,7 +77,7 @@ def collect_samples(root=ADNI_ROOT):
 INDEX_TO_CLASS = {v: k for k, v in CLASS_TO_INDEX.items()}
 SEED = 42 # for reproducibility
 
-def split_subjects(samples, seed=SEED, ratios=(0,70, 0.15, 0.15)):
+def split_subjects(samples, seed=SEED, ratios=(0.70, 0.15, 0.15)):
     """
     Split slice records into train/val/test, stratified by class, by SUBJECT.
 
