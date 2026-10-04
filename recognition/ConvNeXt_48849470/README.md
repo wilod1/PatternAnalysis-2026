@@ -84,3 +84,9 @@ Kernel-size gains saturated at 7×7 in this regime and at 5×5 in the larger one
 - Slice-level class balance: 49% AD in train, 50% in val, 44% in test. Always predicting NC gives 55.7% on test.
 - Window mix is broadly similar across splits, but test has more scans in window 94-113 (26% vs 19% in train), a mostly NC window. Accuracy is reported per window for this reason.
 - Limitation: the test set holds 102 subjects (33 AD), so confidence intervals are resampled over subjects, not slices.
+
+### Input size
+- All slices are 256 wide × 240 tall, single-channel (8-bit grayscale).
+- With a stride-4 stem and three 2× downsamples, 240 rows give 60, 30, 15 and then 7 (the odd 15 drops a row). Padding to 256×256 gives 64, 32, 16, 8.
+- Decision: zero-pad 8 rows at top and bottom to 256×256, applied before normalisation so padding matches the black background. No resampling, so no interpolation artefacts.
+- Input size is a parameter (`img_size`, default 256) so a smaller size can be tested as an ablation.
