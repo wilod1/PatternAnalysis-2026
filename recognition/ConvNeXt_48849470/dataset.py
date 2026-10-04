@@ -204,8 +204,7 @@ def build_transforms(train, mean, std, img_size=PAD_SIZE, hflip=False):
     steps = [transforms.Lambda(_pad_to_square)]
     if train:
         steps.append(transforms.RandomAffine(
-            degrees=10, translate=(0.05, 0.05), scale=(0.9, 1.1), fill=0
-        ))
+        degrees=8, translate=(0.03, 0.03), scale=(0.95, 1.05), fill=0))
         steps.append(transforms.ColorJitter(brightness=0.1, contrast=0.1))
         if hflip:
             steps.append(transforms.RandomHorizontalFlip())
