@@ -35,7 +35,7 @@ def load_scan_table(root=ADNI_ROOT):
     return table
 
 
-def collect_sampes(root=ADNI_ROOT):
+def collect_samples(root=ADNI_ROOT):
     """
     Pool the provided train/test folders into one record per slice.
 
