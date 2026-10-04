@@ -75,3 +75,12 @@ Kernel-size gains saturated at 7×7 in this regime and at 5×5 in the larger one
 - JSON labels: 0 (NC) 810 scans, 1 (not in the folders) 625 scans, 2 (AD) 754 scans. Folders contain only labels 0 and 2.
 - Slice windows: scans fall into 9 distinct 20-slice windows, and window is strongly associated with class. Window 75 to 94 holds 129 AD and 1 NC scan. Windows 94 to 113 and 95 to 114 hold 53 AD and 349 NC scans. A window-only majority classifier reaches 68.2% scan-level accuracy (1,041 of 1,526, fitted and scored on the same data) against 51.3% for always predicting NC. Slice depth is therefore a possible shortcut. Mitigation: report accuracy per window group and compare against a window-only baseline.
 - Split plan: pool all scans, stratified 70/15/15 split by subject with a fixed seed, with a test asserting no subject spans two splits.
+
+### Split design
+- The provided train/test folders share 216 of 331 test subjects, so they are pooled (1,526 scans, 30,520 slices) and re-split by subject.
+- Split unit: subject. All scans and slices of a subject go to one split. No subject has both classes, so class is the stratum.
+- Ratios: 70/15/15 train/val/test, seed 42. Validation is used for tuning and early stopping. Test is used only for final results.
+- Result: train 476 subjects (155 AD / 321 NC, 1,078 scans, 21,560 slices), val 102 (33 AD / 69 NC, 229 scans, 4,580 slices), test 102 (33 AD / 69 NC, 219 scans, 4,380 slices).
+- Slice-level class balance: 49% AD in train, 50% in val, 44% in test. Always predicting NC gives 55.7% on test.
+- Window mix is broadly similar across splits, but test has more scans in window 94-113 (26% vs 19% in train), a mostly NC window. Accuracy is reported per window for this reason.
+- Limitation: the test set holds 102 subjects (33 AD), so confidence intervals are resampled over subjects, not slices.
