@@ -238,7 +238,7 @@ class ADNISliceDataset(Dataset):
 
 
 def get_dataloaders(batch_size=64, img_size=PAD_SIZE, seed=SEED, num_workers=4,
-                    hflip=False, root=ADNI_ROOT):
+                    hflip=False, root=ADNI_ROOT, subset=None):
     """
     Build train/val/test DataLoaders from the subject-level split.
 
@@ -246,6 +246,10 @@ def get_dataloaders(batch_size=64, img_size=PAD_SIZE, seed=SEED, num_workers=4,
     """
     splits = split_subjects(collect_samples(root), seed=seed)
     mean, std = compute_norm_stats(splits["train"], seed=seed)
+
+    if subset:  # smoke tests only: random subset of slices per split
+        rng = random.Random(seed)
+        splits = {k: rng.sample(v, min(subset, len(v))) for k, v in splits.items()}
 
     loaders = {}
     for name, records in splits.items():
