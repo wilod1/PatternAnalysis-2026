@@ -90,3 +90,11 @@ Kernel-size gains saturated at 7×7 in this regime and at 5×5 in the larger one
 - With a stride-4 stem and three 2× downsamples, 240 rows give 60, 30, 15 and then 7 (the odd 15 drops a row). Padding to 256×256 gives 64, 32, 16, 8.
 - Decision: zero-pad 8 rows at top and bottom to 256×256, applied before normalisation so padding matches the black background. No resampling, so no interpolation artefacts.
 - Input size is a parameter (`img_size`, default 256) so a smaller size can be tested as an ablation.
+
+### Augmentation and input size
+- Slices are brain-extracted (no skull or scalp) and look sagittal, with the cerebellum at the upper left in every scan. The brain's position in the frame varies between scans, and image quality and contrast vary too (see `assets/sample_grid.png`).
+- Input: 256×240 slices are zero-padded to 256×256 (8 rows top and bottom) so a stride-4 stem and three 2× downsamples give clean stage sizes of 64, 32, 16 and 8. Padding precedes normalisation and matches the black background. `img_size` is a parameter for ablations.
+- Normalisation: mean 0.1086 and std 0.2200, computed on the padded training slices only.
+- Augmentation (training only, applied after padding): rotation up to 8°, translation up to 3%, scale 0.95 to 1.05, and brightness and contrast jitter of 0.1. Position varies naturally between scans and contrast varies with scanner and acquisition, so these mimic real variation without cutting off the brain.
+- No horizontal or vertical flips. In a sagittal view a left-right flip swaps front and back, producing anatomy that never occurs in the data.
+- Candidate failure cases noted from the sample grid: train AD slice 90 (blurry, patchy upper edge) and test NC slice 98 (dark, unusual contrast).
