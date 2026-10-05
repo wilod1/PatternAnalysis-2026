@@ -1,0 +1,44 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[margin=1.5cm]{geometry}
+\usepackage{amsmath,graphicx,booktabs,enumitem}
+\setlist{nosep,leftmargin=*}
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+\newcommand{\sect}[1]{\par\vspace{2pt}{\large\textbf{#1}}\par}
+
+\begin{document}
+
+{\Large\textbf{Feasibility Review: AD vs CN Classification on ADNI with ConvNeXt}}\\
+COMP3710 Pattern Recognition \quad\textbar\quad William O'Driscoll, 48849470
+
+\vspace{0.3cm}
+\sect{1. User need, scope and acceptance criteria}
+\textbf{User:} A clinician reviewing screening T1-weighted brain MRIs who needs a classifier that decides confident cases automatically and routes uncertain ones to an expert. \textbf{Scope.} A prototype classifying 2D ADNI slices as Alzheimer's disease (AD) or cognitively normal (CN), and testing whether its confidence is trustworthy compared with simpler baselines (the open dilemma). Targets are provisional.
+\begin{enumerate}
+\vspace{0.1cm}
+  \item \textbf{Accuracy:} per-slice test accuracy $\geq 0.80$ on a subject-level split, with a 95\% bootstrap interval resampled over subjects.
+  \vspace{0.1cm}
+  \item \textbf{Beyond the shortcut:} exceed the slice-window-only baseline (66.2\% on test) and, within each mixed-class window, exceed that window's majority-class rate.
+  \vspace{0.1cm}
+  \item \textbf{Calibration:} ECE and reliability diagrams for the MLP, CNN and ConvNeXt, comparing confidence on correct and wrong predictions; ConvNeXt compared with the baselines on macro-F1, AUROC and ECE.
+  \vspace{0.1cm}
+  \item \textbf{Reject option:} a confidence threshold giving $\geq 0.90$ accuracy on accepted slices at $\geq 50\%$ coverage, with coverage and residual errors reported.
+  \vspace{0.1cm}
+  \item \textbf{Resources:} peak GPU memory $\leq 16$~GB and $\leq 6$~h per training run on one A100.
+\end{enumerate}
+
+\vspace{0.3cm}
+\sect{2. Model choice and course concepts}
+\textbf{Data:} ADNI AD/CN 2D slices (256$\times$240 grayscale, 20 per scan), zero-padded to 256$\times$256 so stage resolutions halve cleanly. \textbf{Model:} a reduced ConvNeXt (Liu et al., 2022; Hard difficulty) trained from scratch, as pretrained weights are not permitted. ConvNeXt-T uses four stages with 3, 3, 9 and 3 blocks and widths of 96 to 768. The reduced model keeps the same block design (4$\times$4 patchify stem, 7$\times$7 depthwise convolution, LayerNorm, 4$\times$ inverted bottleneck with a single GELU, layer scale and stochastic depth) but uses fewer blocks and channels to suit the dataset size and compute budget. In the paper's ablations these design steps raise ImageNet-1K top-1 accuracy from 78.8\% to 82.0\% (ResNet-50 regime). That evidence comes from far larger data, so transfer to small brain-MRI data is tested, not assumed. Training uses AdamW with weight decay and a cosine schedule. Augmentation is mild (small rotation, shift, scale and intensity jitter) with no flips, because left--right flips of these sagittal-looking slices would swap the front and back of the head.
+\textbf{Baselines:} window-only, MLP and CNN on identical splits, giving a progression from no anatomy, to no spatial structure, to local filters, to a modern design. \textbf{Evaluation:} per slice, as recommended for 2D models, with confidence intervals resampled over subjects. \textbf{Course concepts:} convolutional inductive bias, normalisation, regularisation (weight decay, stochastic depth, augmentation), probabilistic calibration and selective prediction (risk--coverage).
+
+\vspace{0.3cm}
+\sect{3. Preliminary feasibility evidence}
+\textbf{Data audit} (1{,}526 scans, 680 subjects, 30{,}520 slices): the provided train/test folders share 216 of 331 test subjects, so all scans are pooled and re-split by subject (70/15/15, seed 42). The test set holds 102 subjects (33 AD), 219 scans and 4{,}380 slices. No subject has both classes. Slice window is strongly tied to class: a window-only rule fitted on the training split scores 66.2\% on test (65.5\% validation) against 55.7\% for always predicting the training majority, so about 10 points of any result can come from slice depth alone. Accuracy is therefore also reported per window. \textbf{Pipeline test:} a short run (3 epochs on a 2{,}000-slice subset) exercised data loading, the CNN, the training loop and checkpointing end to end; accuracy at that scale is not meaningful.
+
+\vspace{0.3cm}
+\sect{4. Risks, budget, next experiment and fallback}
+\textbf{Risks and mitigations:} (i) the subject-level split lowers accuracy relative to the leaking provided split, and 0.80 may be hard from scratch; stochastic depth, weight decay, augmentation and early stopping on validation address overfitting. (ii) The slice-window shortcut; the window-only baseline, per-window accuracy and a window check on failure cases expose it. (iii) A small effective test set (102 subjects) gives wide intervals; differences between models are claimed only where bootstrap intervals separate. (iv) GPU queue waits of about 12~h limit the number of runs; jobs are submitted early as batch scripts, tested on small subsets first, with several configurations per job where possible. \textbf{Budget:} one A100 through Slurm batch jobs, each capped at 6~h, with a planned total of about eight runs (CNN, MLP, three to four ConvNeXt configurations and final seeds). \textbf{Next experiment:} a full CNN baseline run, then a first ConvNeXt run after a one-batch overfitting check. \textbf{Fallback:} if ConvNeXt misses 0.80, first reduce width and depth or strengthen regularisation; if it is still short, report the result, since the calibration, reject-option and failure analysis carry the dilemma investigation. A second architecture (GFNet) is only attempted after the core analysis is complete.
+
+\end{document}
