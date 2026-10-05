@@ -98,3 +98,8 @@ Kernel-size gains saturated at 7×7 in this regime and at 5×5 in the larger one
 - Augmentation (training only, applied after padding): rotation up to 8°, translation up to 3%, scale 0.95 to 1.05, and brightness and contrast jitter of 0.1. Position varies naturally between scans and contrast varies with scanner and acquisition, so these mimic real variation without cutting off the brain.
 - No horizontal or vertical flips. In a sagittal view a left-right flip swaps front and back, producing anatomy that never occurs in the data.
 - Candidate failure cases noted from the sample grid: train AD slice 90 (blurry, patchy upper edge) and test NC slice 98 (dark, unusual contrast).
+
+### Smoke test
+- Setup: SimpleCNN trained for 3 epochs on a random subset of slices (2,000 per split) as a pipeline check.
+- Result: data loading, model, training loop, checkpointing and curve plotting ran end to end without errors. The run's loss, accuracy and timing values were not retained. Accuracy at this scale is not meaningful, so the test only shows that the pipeline is operational.
+- Next: the full baseline CNN run (Phase 4) is the first logged result.
