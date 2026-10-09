@@ -136,6 +136,10 @@ def main():
     history = {k: [] for k in ("train_loss", "train_acc", "val_loss", "val_acc")}
     best_acc, ckpt_path = -1.0, os.path.join(CKPT_DIR, f"{run}_best.pt")
 
+    history_path = os.path.join(RESULTS, f"{run}_history.json")
+    summary = {"run": run, "args": vars(args), "params": n_params,
+               "best_val_acc": best_acc, "history": history}
+
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         tr_loss, tr_acc = train_one_epoch(model, loaders["train"], optimizer,
@@ -150,16 +154,18 @@ def main():
         print(f"epoch {epoch:3d} | train loss {tr_loss:.4f} acc {tr_acc:.4f} | "
               f"val loss {va_loss:.4f} acc {va_acc:.4f} | {time.time() - t0:.0f}s")
 
-    plot_curves(history, os.path.join(ASSETS, f"{run}_curves.png"))
-    summary = {"run": run, "args": vars(args), "params": n_params,
-               "best_val_acc": best_acc, "history": history}
+        summary["best_val_acc"] = best_acc
+        with open(history_path, "w") as f:
+            json.dump(summary, f, indent=2)
+        plot_curves(history, os.path.join(ASSETS, f"{run}_curves.png"))
+
     if args.eval_test:
         model.load_state_dict(torch.load(ckpt_path)["state_dict"])
         te_loss, te_acc = evaluate(model, loaders["test"], criterion, device)
         summary.update(test_loss=te_loss, test_acc=te_acc)
         print(f"TEST (best checkpoint): loss {te_loss:.4f} acc {te_acc:.4f}")
-    with open(os.path.join(RESULTS, f"{run}_history.json"), "w") as f:
-        json.dump(summary, f, indent = 2)
+    with open(history_path, "w") as f:
+        json.dump(summary, f, indent=2)
 
 
 if __name__ == "__main__":
