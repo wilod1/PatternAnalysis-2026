@@ -13,7 +13,7 @@ import torch
 from torch import nn
 
 from dataset import SEED, get_dataloaders
-from modules import SimpleCNN
+from modules import SimpleCNN, SimpleResNet
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.join(HERE, "assets")
@@ -33,7 +33,7 @@ def build_model(name):
     """
     Return a fresh model by name.
     """
-    models = {"cnn": SimpleCNN}
+    models = {"cnn": SimpleCNN, "resnet": SimpleResNet}
     if name not in models:
         raise ValueError(f"Unknown model '{name}'. Choose from {list(models)}")
     return models[name]()
