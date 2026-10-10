@@ -31,3 +31,28 @@ def load_predictions(path, split):
         "windows": data[f"{split}_window"],
     }
 
+
+def classification_metrics(labels, preds, p_ad):
+    """
+    Accuracy, per-class precision/recall/F1, macro-F1 and AUROC (AD is the
+    positive class). A class with no predictions get precision 0.
+    """
+    out = {"accuracy": float((preds == labels).mean())}
+    f1s = []
+    for c, name in enumerate(CLASS_NAMES):
+        tp = np.sum((preds == c) & (labels == c))
+        fp = np.sum((preds == c) & (labels != c))
+        fn = np.sum((preds != c) & (labels == c))
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = (2 * precision * recall / (precision + recall)
+              if precision + recall else 0.0)
+        out[f"precision_{name}"] = float(precision)
+        out[f"recall_{name}"] = float(recall)
+        out[f"f1_{name}"] = float(f1)
+        f1s.append(f1)
+    out["macro_f1"] = float(np.mean(f1s))
+    out["auroc"] = (float(roc_auc_score(labels, p_ad))
+                    if len(np.unique(labels)) == 2 else float("nan"))
+    return out
+
