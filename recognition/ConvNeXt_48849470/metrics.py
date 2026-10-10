@@ -431,14 +431,14 @@ def agreement_analysis(runs_data, reference=None, top_subjects=10):
             if not np.array_equal(runs_data[r][key], first[key]):
                 raise ValueError(f"{r} and {runs[0]} disagree on '{key}': "
                                  "prediction files must be from the same split")
-        reference = reference or runs[-1]
-        labels = first["labels"]
-        wrong = {r: runs_data[r]["preds"] != labels for r in runs}
+    reference = reference or runs[-1]
+    labels = first["labels"]
+    wrong = {r: runs_data[r]["preds"] != labels for r in runs}
     n_wrong = np.sum([wrong[r] for r in runs], axis=0)  # models wrong per slice
 
     pairs = {}
     for i, a in enumerate(runs):
-        for b in runs[i + 1]:
+        for b in runs[i + 1:]:
             both = int((wrong[a] & wrong[b]).sum())
             union = int((wrong[a] | wrong[b]).sum())
             pairs[f"{a} & {b}"] = {
