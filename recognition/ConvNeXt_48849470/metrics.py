@@ -97,3 +97,47 @@ def accuracy_by_window(data):
             "accuracy": float((data["preds"][mask] == labels).mean()),
         }
     return rows
+
+
+def benchmark(pred_path, split, n_boot=1000, seed=0):
+    """
+    Full benchmark for one prediction file and split.
+    """
+    data = load_predictions(pred_path, split)
+    return {
+        "split": split,
+        "n_slices": int(len(data["labels"])),
+        "n_subjects": int(len(np.unique(data["subjects"]))),
+        "metrics": classification_metrics(data["labels"], data["preds"],
+                                          data["probs"][:, 1]),
+        "ci95": subject_bootstrap_ci(data, n_boot, seed),
+        "by_window": accuracy_by_window(data),
+    }
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--runs", nargs="+", required=True,
+                   help="run names; window_only for the window baseline")
+    p.add_argument("--split", choices=["val", "test"], default="val",
+                   help="use test only for the final models (Phase 8)")
+    p.add_argument("--n-boot", type=int, default=1000)
+    a = p.parse_args()
+
+    results = {}
+    for run in a.runs:
+        path = os.path.join(HERE, "results", f"preds_{run}.npz")
+        results[run] = benchmark(path, a.split, a.n_boot)
+        m, ci = results[run]["metrics"], results[run]["ci95"]
+        print(f"{run:14s} acc {m['accuracy']:.3f} "
+              f"[{ci['accuracy'][0]:.3f}, {ci['accuracy'][1]:.3f}]  "
+              f"macro-F1 {m['macro_f1']:.3f}  AUROC {m['auroc']:.3f}")
+
+    out_path = os.path.join(HERE, "results", f"benchmark_{a.split}.json")
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"saved {out_path}")
+
+
+if __name__ == "__main__":
+    main()
