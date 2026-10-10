@@ -76,3 +76,24 @@ def subject_bootstrap_ci(data, n_boot=1000, seed=0, level=0.95):
     return {m: [float(np.nanpercentile([s[m] for s in samples], lo)),
                 float(np.nanpercentile([s[m] for s in samples], hi))]
             for m in samples[0]}
+
+
+def accuracy_by_window(data):
+    """
+    Per slice window: number of slices, AD share, the majority-class rate in
+    that window (the accuracy of always guessing the window's commoner class on
+    this split) and the model's accuracy. A model that uses anatomy should beat
+    the majority rate inside windows where both classes occur.
+    """
+    rows = {}
+    for w in np.unique(data["windows"]):
+        mask = data["windows"] == w
+        labels = data["labels"][mask]
+        ad_share = labels.mean()
+        rows[str(w)] = {
+            "n": int(mask.sum()),
+            "ad_share": float(ad_share),
+            "majority_rate": float(max(ad_share, 1 - ad_share)),
+            "accuracy": float((data["preds"][mask] == labels).mean()),
+        }
+    return rows
