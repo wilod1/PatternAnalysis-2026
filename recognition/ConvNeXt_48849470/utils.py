@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 from torch.utils.data import RandomSampler
-from collections import Counter
+from collections import Counter, defaultdict
 
 from dataset import (ADNISliceDataset, CLASS_TO_INDEX, SEED, build_transforms,
                      collect_samples, split_subjects)
