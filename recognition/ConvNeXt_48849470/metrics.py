@@ -288,6 +288,135 @@ def plot_confidence_histograms(runs_data, path, n_bins=10):
     plt.close(fig)
 
 
+def risk_coverage_curve(conf, correct):
+    """
+    Accuracy of the accepted predictions as the confidence threshold is lowered.
+    Coverage is the fraction of slices decided automatically (confidence >=
+    threshold). Predictions tied at one confidence are accepted together, so a
+    threshold never splits a tie. Arrays run from the highest threshold (low
+    coverage) to the lowest (coverage 1.0).
+    """
+    order = np.argsort(-conf, king="stable")
+    c = conf[order]
+    hits = np.cumsum(correct[order])
+    n = np.arange(1, len(c) + 1)
+    last = np.r_[c[1:] != c[:-1], True] # last item of each run of equal confidence
+    return {"threshold": c[last], "coverage": n[last] / len(c),
+            "accuracy": hits[last] / n[last]}
+
+
+def operating_point(conf, correct, threshold):
+    """
+    What a reject rule does on this data: accept predictions with confidence >=
+    threshold, send the rest to human review. Counts the errors on each side.
+    """
+    accept = conf >= threshold
+    n_accept = int(accept.sum())
+    return {
+        "threshold": float(threshold),
+        "coverage": float(n_accept / len(conf)),
+        "accuracy_accepted": (float(correct[accept].mean())
+                              if n_accept else float("nan")),
+        "n_accepted": n_accept,
+        "n_review": int(len(conf) - n_accept),
+        "errors_accepted": int((~correct[accept]).sum()),
+        "errors_sent_to_review": int((~correct[~accept]).sum()),
+    }
+
+
+def reject_analysis(val_data, test_data=None, target_acc=0.90, min_coverage=0.5):
+    """
+    Choose a confidence threshold on VALIDATION data only, then report what it
+    does there and, if test_data is given, on test data with the same threshold.
+
+    Rule: the lowest threshold (highest coverage) whose accepted predictions
+    reach target_acc while coverage stays at least min_coverage. If no threshold
+    does, fall back to the best accuracy at coverage >= min_coverage and flag
+    target_met_on_val as False so the shortfall is reported, not hidden.
+    """
+    conf, correct = confidence_and_correct(val_data["probs"], val_data["labels"])
+    curve = risk_coverage_curve(conf, correct)
+    ok = (curve["accuracy"] >= target_acc) & (curve["coverage"] >= min_coverage)
+    if ok.any():
+        threshold, met = float(curve["threshold"][ok][-1]), True
+    else:
+        pool = curve["coverage"] >= min_coverage
+        best = int(np.argmax(np.where(pool, curve["accuracy"], -1.0)))
+        threshold, met = float(curve["threshold"][best]), False
+    result = {"target_acc": target_acc, "min_coverage": min_coverage,
+              "target_met_on_val": met, "threshold": threshold,
+              "val": operating_point(conf, correct, threshold)}
+    if test_data is not None:
+        t_conf, t_correct = confidence_and_correct(test_data["probs"],
+                                                   test_data["labels"])
+        result["test"] = operating_point(t_conf, t_correct, threshold)
+    return result
+
+
+def plot_risk_coverage(runs_data, path, target_acc=0.90, min_coverage=0.5,
+                       points=None):
+    """
+    Accuracy of accepted slices against coverage, one line per run. The dashed
+    lines mark the target accuracy and the minimum coverage, so the acceptable
+    region is the top-right corner. points maps run -> (coverage, accuracy) of
+    its chosen threshold, drawn as a marker on that run's line.
+    """
+    fig, ax = plt.subplots(figsize=(5.4, 5.6), facecolor=SURFACE)
+    ax.axhline(target_acc, linestyle="--", color="#9a9992", linewidth=1.2,
+               label=f"target accuracy {target_acc:.2f}")
+    ax.axvline(min_coverage, linestyle=":", color="#9a9992", linewidth=1.2,
+               label=f"minimum coverage {min_coverage:.2f}")
+    for run, data in runs_data.items():
+        conf, correct = confidence_and_correct(data["probs"], data["labels"])
+        curve = risk_coverage_curve(conf, correct)
+        ax.plot(curve["coverage"], curve["accuracy"], linewidth=1.8,
+                color=run_colour(run), label=run)
+        if points and run in points:
+            ax.plot(*points[run], marker="o", markersize=8, color=run_colour(run),
+                    markeredgecolor=SURFACE, linestyle="none")
+    ax.set(xlim=(0.0, 1.0), ylim=(0.4, 1.0), xlabel="coverage (share decided automatically)",
+           ylabel="accuracy of accepted slices", title="Risk-coverage")
+    _style_axes(ax)
+    legend = ax.legend(frameon=False, fontsize=8, loc="upper center",
+                       bbox_to_anchor=(0.5, -0.16))
+    for text in legend.get_texts():
+        text.set_color(INK_2)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, facecolor=SURFACE, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_reject_analysis(a, loaded):
+    """
+    Reject-option analysis for every run, written to results/reject_option_<split>.json
+    and assets/risk_coverage_<split>.png. The threshold always comes from the
+    validation split; with --split test it is then applied to test.
+    """
+    out, points = {}, {}
+    for run, data in loaded.items():
+        if a.split == "val":
+            val, test = data, None
+        else:
+            val = load_predictions(
+                os.path.join(HERE, "results", f"preds_{run}.npz"), "val")
+            test = data
+        out[run] = reject_analysis(val, test, a.target_acc, a.min_coverage)
+        r = out[run]
+        shown = r["val"] if a.split == "val" else r["test"]
+        points[run] = (shown["coverage"], shown["accuracy_accepted"])
+        print(f"{run:14s} threshold {r['threshold']:.3f} "
+              f"({'target met' if r['target_met_on_val'] else 'TARGET NOT MET'} on val)  "
+              f"{a.split}: coverage {shown['coverage']:.3f}, accuracy accepted "
+              f"{shown['accuracy_accepted']:.3f}, {shown['n_review']} to review, "
+              f"{shown['errors_accepted']} errors accepted")
+    os.makedirs(os.path.join(HERE, "assets"), exist_ok=True)
+    with open(os.path.join(HERE, "results", f"reject_option_{a.split}.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    plot_risk_coverage(loaded, os.path.join(HERE, "assets", f"risk_coverage_{a.split}.png"),
+                       a.target_acc, a.min_coverage, points)
+    print("saved reject-option json and figure")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--runs", nargs="+", required=True,
@@ -297,6 +426,12 @@ def main():
     p.add_argument("--n-boot", type=int, default=1000)
     p.add_argument("--calibration", action="store_true",
                    help="also write calibration metrics and figures")
+    p.add_argument("--reject", action="store_true",
+                   help="also run the reject-option (risk-coverage) analysis")
+    p.add_argument("--target-acc", type=float, default=0.90,
+                   help="accuracy wanted on accepted slices")
+    p.add_argument("--min-coverage", type=float, default=0.5,
+                   help="smallest acceptable share decided automatically")
     a = p.parse_args()
 
     results, loaded = {}, {}
@@ -332,6 +467,9 @@ def main():
         plot_confidence_histograms(
             loaded, os.path.join(HERE, "assets", f"confidence_hist_{a.split}.png"))
         print("saved calibration json and figures")
+
+    if a.reject:
+        run_reject_analysis(a, loaded)
 
 
 if __name__ == "__main__":
