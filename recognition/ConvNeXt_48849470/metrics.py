@@ -56,3 +56,23 @@ def classification_metrics(labels, preds, p_ad):
                     if len(np.unique(labels)) == 2 else float("nan"))
     return out
 
+
+def subject_bootstrap_ci(data, n_boot=1000, seed=0, level=0.95):
+    """
+    Percentile bootstrap interval for every metric in classification_metrics.
+    Each resample draws subjects with replacement and keeps all of a drawn
+    subject's slices. Returns {metric: [low, high]}.
+    """
+    labels, preds, p_ad = data["labels"], data["preds"], data["probs"][:, 1]
+    subjects, inverse = np.unique(data["subjects"], return_inverse=True)
+    groups = [np.flatnonzero(inverse == k) for k in range(len(subjects))]
+    rng = np.random.default_rng(seed)
+    samples = []
+    for _ in range(n_boot):
+        drawn = rng.integers(0, len(groups), len(groups))
+        idx = np.concatenate([groups[k] for k in drawn])
+        samples.append(classification_metrics(labels[idx], preds[idx], p_ad[idx]))
+    lo, hi = (1 - level) / 2 * 100, (1 + level) / 2 * 100
+    return {m: [float(np.nanpercentile([s[m] for s in samples], lo)),
+                float(np.nanpercentile([s[m] for s in samples], hi))]
+            for m in samples[0]}
