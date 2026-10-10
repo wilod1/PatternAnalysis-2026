@@ -14,8 +14,17 @@ import os
 import numpy as np
 from sklearn.metrics import roc_auc_score
 
+import matplotlib
+matplotlib.use("Agg")  # no display on the cluster
+import matplotlib.pyplot as plt
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CLASS_NAMES = ("nc", "ad")
+# figure styling: light surface, recessive grid, one fixed colour per model family
+SURFACE, INK, INK_2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e3e2dd"
+FAMILY_COLOURS = {"window": "#6b6b66", "cnn": "#2a78d6",
+                  "resnet": "#eb6834", "convnext": "#1baf7a"}
+CORRECT_COLOUR, WRONG_COLOUR = "#2a78d6", "#eb6834"
 
 
 def load_predictions(path, split):
@@ -119,6 +128,166 @@ def benchmark(pred_path, split, n_boot=1000, seed=0):
     }
 
 
+def confidence_and_correct(probs, labels):
+    """
+    Confidence (probability of the predicted class) and whether it was right.
+    """
+    return probs.max(axis=1), probs.argmax(axis=1) == labels
+
+
+def reliability_bins(conf, correct, n_bins=10):
+    """
+    Group predictions into equal-width confidence bins over [0.5, 1] (with two
+    classes the top probability is never below 0.5). Returns the bin edges,
+    counts, mean confidence and accuracy per bin (NaN for empty bins).
+    """
+    edges = np.linspace(0.5, 1.0, n_bins + 1)
+    idx = np.digitize(conf, edges[1:-1])  # 0 .. n_bins-1; conf == 1.0 -> last bin
+    counts = np.bincount(idx, minlength=n_bins)
+    sum_conf = np.bincount(idx, weights=conf, minlength=n_bins)
+    sum_correct = np.bincount(idx, weights=correct.astype(float), minlength=n_bins)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean_conf = np.where(counts > 0, sum_conf / counts, np.nan)
+        accuracy = np.where(counts > 0, sum_correct / counts, np.nan)
+    return {"edges": edges, "counts": counts,
+            "mean_conf": mean_conf, "accuracy": accuracy}
+
+
+def expected_calibration_error(conf, correct, n_bins=10):
+    """
+    ECE: the average gap between confidence and accuracy over the bins,
+    weighted by how many predictions fall in each bin.
+    """
+    b = reliability_bins(conf, correct, n_bins)
+    full = b["counts"] > 0
+    gap = np.abs(b["accuracy"][full] - b["mean_conf"][full])
+    return float(np.sum(gap * b["counts"][full]) / b["counts"].sum())
+
+
+def calibration_summary(data, n_bins=10):
+    """
+    ECE, Brier score and how confident the model is when right vs when wrong.
+    A calibrated model is clearly less confident on its mistakes.
+    """
+    conf, correct = confidence_and_correct(data["probs"], data["labels"])
+    brier = np.mean((data["probs"][:, 1] - data["labels"]) ** 2)
+    return {
+        "ece": expected_calibration_error(conf, correct, n_bins),
+        "brier": float(brier),
+        "accuracy": float(correct.mean()),
+        "mean_confidence": float(conf.mean()),
+        "mean_conf_correct": (float(conf[correct].mean())
+                              if correct.any() else float("nan")),
+        "mean_conf_wrong": (float(conf[~correct].mean())
+                            if (~correct).any() else float("nan")),
+        "n_bins": n_bins,
+    }
+
+
+def ece_bootstrap_ci(data, n_boot=1000, seed=0, n_bins=10, level=0.95):
+    """
+    Percentile interval for ECE, resampling whole subjects like the other CIs.
+    """
+    conf, correct = confidence_and_correct(data["probs"], data["labels"])
+    subjects, inverse = np.unique(data["subjects"], return_inverse=True)
+    groups = [np.flatnonzero(inverse == k) for k in range(len(subjects))]
+    rng = np.random.default_rng(seed)
+    eces = []
+    for _ in range(n_boot):
+        drawn = rng.integers(0, len(groups), len(groups))
+        idx = np.concatenate([groups[k] for k in drawn])
+        eces.append(expected_calibration_error(conf[idx], correct[idx], n_bins))
+    lo, hi = (1 - level) / 2 * 100, (1 + level) / 2 * 100
+    return [float(np.percentile(eces, lo)), float(np.percentile(eces, hi))]
+
+
+def run_colour(run):
+    """
+    One fixed colour per model family, so a model keeps its colour in every figure.
+    """
+    family = "window" if run.startswith("window") else run.split("_")[0]
+    return FAMILY_COLOURS.get(family, "#6b6b66")
+
+
+def _style_axes(ax):
+    """
+    Light surface, recessive grid and axes, no top or right spine.
+    """
+    ax.set_facecolor(SURFACE)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    for side in ("left", "bottom"):
+        ax.spines[side].set_color(GRID)
+    ax.tick_params(colors=INK_2, labelsize=9)
+    ax.grid(color=GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    ax.xaxis.label.set_color(INK_2)
+    ax.yaxis.label.set_color(INK_2)
+    ax.title.set_color(INK)
+
+
+def plot_reliability_diagram(runs_data, path, n_bins=10, min_count=10):
+    """
+    One reliability diagram for all runs: accuracy against mean confidence per
+    bin. Points on the dashed diagonal are perfectly calibrated; below it means
+    overconfident. Bins with fewer than min_count predictions are left out.
+    """
+    fig, ax = plt.subplots(figsize=(5.4, 5.6), facecolor=SURFACE)
+    ax.plot([0.5, 1.0], [0.5, 1.0], linestyle="--", color="#9a9992",
+            linewidth=1.2, label="perfect calibration")
+    for run, data in runs_data.items():
+        conf, correct = confidence_and_correct(data["probs"], data["labels"])
+        b = reliability_bins(conf, correct, n_bins)
+        keep = b["counts"] >= min_count
+        ece = expected_calibration_error(conf, correct, n_bins)
+        ax.plot(b["mean_conf"][keep], b["accuracy"][keep], marker="o",
+                markersize=6, linewidth=1.8, color=run_colour(run),
+                markeredgecolor=SURFACE, label=f"{run} (ECE {ece:.3f})")
+    ax.set(xlim=(0.5, 1.0), ylim=(0.0, 1.0), xlabel="mean confidence in bin",
+           ylabel="accuracy in bin", title="Reliability diagram")
+    _style_axes(ax)
+    legend = ax.legend(frameon=False, fontsize=8, loc="upper center",
+                       bbox_to_anchor=(0.5, -0.16))  # below the axes, off the data
+    for text in legend.get_texts():
+        text.set_color(INK_2)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150, facecolor=SURFACE, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_confidence_histograms(runs_data, path, n_bins=10):
+    """
+    One panel per run: the distribution of confidence for correct and for wrong
+    predictions, each as a share of its own group so the shapes are comparable.
+    A useful model puts its mistakes at lower confidence than its hits.
+    """
+    n = len(runs_data)
+    fig, axes = plt.subplots(1, n, figsize=(3.7 * n, 3.8), sharey=True,
+                             facecolor=SURFACE, squeeze=False)
+    edges = np.linspace(0.5, 1.0, n_bins + 1)
+    centres, width = (edges[:-1] + edges[1:]) / 2, edges[1] - edges[0]
+    for i, (ax, (run, data)) in enumerate(zip(axes[0], runs_data.items())):
+        conf, correct = confidence_and_correct(data["probs"], data["labels"])
+        for sel, colour, name, shift in ((correct, CORRECT_COLOUR, "correct", -1),
+                                         (~correct, WRONG_COLOUR, "wrong", 1)):
+            share = np.histogram(conf[sel], bins=edges)[0] / max(int(sel.sum()), 1)
+            ax.bar(centres + shift * width / 4, share, width=width / 2,
+                   color=colour, edgecolor=SURFACE, linewidth=1.0, label=name)
+        ax.set(xlim=(0.5, 1.0), xlabel="confidence",
+               title=f"{run}\n{int((~correct).sum())} wrong of {len(correct)}")
+        if i == 0:
+            ax.set_ylabel("share of predictions in group")
+        _style_axes(ax)
+    handles, labels = axes[0][0].get_legend_handles_labels()
+    legend = fig.legend(handles, labels, loc="upper center", ncol=2,
+                        frameon=False, fontsize=9)  # one legend above all panels
+    for text in legend.get_texts():
+        text.set_color(INK_2)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    fig.savefig(path, dpi=150, facecolor=SURFACE)
+    plt.close(fig)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--runs", nargs="+", required=True,
@@ -126,12 +295,15 @@ def main():
     p.add_argument("--split", choices=["val", "test"], default="val",
                    help="use test only for the final models (Phase 8)")
     p.add_argument("--n-boot", type=int, default=1000)
+    p.add_argument("--calibration", action="store_true",
+                   help="also write calibration metrics and figures")
     a = p.parse_args()
 
-    results = {}
+    results, loaded = {}, {}
     for run in a.runs:
         path = os.path.join(HERE, "results", f"preds_{run}.npz")
         results[run] = benchmark(path, a.split, a.n_boot)
+        loaded[run] = load_predictions(path, a.split)
         m, ci = results[run]["metrics"], results[run]["ci95"]
         print(f"{run:14s} acc {m['accuracy']:.3f} "
               f"[{ci['accuracy'][0]:.3f}, {ci['accuracy'][1]:.3f}]  "
@@ -141,6 +313,25 @@ def main():
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"saved {out_path}")
+
+    if a.calibration:
+        calibration = {}
+        for run, data in loaded.items():
+            calibration[run] = calibration_summary(data)
+            calibration[run]["ece_ci95"] = ece_bootstrap_ci(data, a.n_boot)
+            c = calibration[run]
+            print(f"{run:14s} ECE {c['ece']:.3f} "
+                  f"[{c['ece_ci95'][0]:.3f}, {c['ece_ci95'][1]:.3f}]  "
+                  f"conf when right {c['mean_conf_correct']:.3f}, "
+                  f"when wrong {c['mean_conf_wrong']:.3f}")
+        os.makedirs(os.path.join(HERE, "assets"), exist_ok=True)
+        with open(os.path.join(HERE, "results", f"calibration_{a.split}.json"), "w") as f:
+            json.dump(calibration, f, indent=2)
+        plot_reliability_diagram(
+            loaded, os.path.join(HERE, "assets", f"reliability_{a.split}.png"))
+        plot_confidence_histograms(
+            loaded, os.path.join(HERE, "assets", f"confidence_hist_{a.split}.png"))
+        print("saved calibration json and figures")
 
 
 if __name__ == "__main__":

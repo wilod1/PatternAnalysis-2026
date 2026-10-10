@@ -4,8 +4,12 @@ Tests for the benchmark metrics, on small hand-checkable examples.
 import numpy as np
 import pytest
 
-from metrics import (accuracy_by_window, classification_metrics,
-                     load_predictions, subject_bootstrap_ci)
+from metrics import (accuracy_by_window, calibration_summary,
+                     classification_metrics, confidence_and_correct,
+                     ece_bootstrap_ci, expected_calibration_error,
+                     load_predictions, plot_confidence_histograms,
+                     plot_reliability_diagram, reliability_bins,
+                     subject_bootstrap_ci)
 
 
 def test_perfect_predictions():
@@ -87,3 +91,56 @@ def test_load_predictions_flattens_tuple_windows(tmp_path):
              val_window=np.array([[60, 80], [80, 100]]))
     d = load_predictions(path, "val")
     assert d["windows"].tolist() == ["60-80", "80-100"]
+
+
+def test_ece_is_zero_when_confidence_matches_accuracy():
+    conf = np.full(10, 0.8)
+    correct = np.array([True] * 8 + [False] * 2)  # 80% right at 80% confidence
+    assert expected_calibration_error(conf, correct) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_ece_of_an_overconfident_model():
+    conf = np.full(10, 0.95)
+    correct = np.array([True] * 5 + [False] * 5)  # 50% right at 95% confidence
+    assert expected_calibration_error(conf, correct) == pytest.approx(0.45)
+
+
+def test_ece_weights_bins_by_size():
+    conf = np.array([0.6] * 5 + [0.9] * 5)
+    correct = np.array([True] * 3 + [False] * 2 + [True] * 5)
+    # bin 0.6: accuracy 0.6, gap 0; bin 0.9: accuracy 1.0, gap 0.1
+    assert expected_calibration_error(conf, correct) == pytest.approx(0.05)
+
+
+def test_reliability_bins_cover_every_prediction():
+    conf = np.array([0.5, 0.73, 1.0])
+    b = reliability_bins(conf, np.array([True, False, True]), n_bins=10)
+    assert b["counts"].sum() == 3
+    assert b["counts"][0] == 1 and b["counts"][-1] == 1  # 0.5 first, 1.0 last
+    assert np.isnan(b["accuracy"][b["counts"] == 0]).all()
+
+
+def test_calibration_summary_hand_example():
+    probs = np.array([[0.9, 0.1], [0.2, 0.8], [0.3, 0.7], [0.6, 0.4]])
+    labels = np.array([0, 1, 0, 0])  # predictions 0, 1, 1, 0 -> third is wrong
+    s = calibration_summary({"probs": probs, "labels": labels})
+    assert s["accuracy"] == pytest.approx(0.75)
+    assert s["mean_confidence"] == pytest.approx(0.75)
+    assert s["mean_conf_correct"] == pytest.approx((0.9 + 0.8 + 0.6) / 3)
+    assert s["mean_conf_wrong"] == pytest.approx(0.7)
+    assert s["brier"] == pytest.approx((0.01 + 0.04 + 0.49 + 0.16) / 4)
+
+
+def test_ece_ci_is_ordered_and_reproducible():
+    data = make_data()
+    lo, hi = ece_bootstrap_ci(data, n_boot=100, seed=2)
+    assert 0.0 <= lo <= hi <= 1.0
+    assert ece_bootstrap_ci(data, 100, seed=2) == [lo, hi]
+
+
+def test_calibration_figures_are_written(tmp_path):
+    runs = {"cnn_cos": make_data(seed=1), "resnet_cos": make_data(seed=2)}
+    plot_reliability_diagram(runs, tmp_path / "rel.png")
+    plot_confidence_histograms(runs, tmp_path / "hist.png")
+    assert (tmp_path / "rel.png").stat().st_size > 1000
+    assert (tmp_path / "hist.png").stat().st_size > 1000
