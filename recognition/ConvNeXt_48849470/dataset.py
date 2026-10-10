@@ -25,6 +25,14 @@ JSON_LABEL_TO_CLASS = {0: "NC", 2: "AD"} # label 1 is not in the folders
 # Subject IDs look like 068_S_0473 inside the JSON "raw" path
 _SUBJECT_RE = re.compile(r"ADNI_(\d+_S_\d+)")
 
+# Augmentation presets: rotation (degrees), translation (fraction of image),
+# scale range, brightness/contrast jitter, gamma range (None = off) and the
+# probability of erasing a random patch. "mild" is the original recipe.
+AUGMENTATIONS = {
+    "mild": (8, 0.03, (0.95, 1.05), 0.1, None, 0.0),
+    "strong": (15, 0.08, (0.85, 1.15), 0.3, (0.7, 1.5), 0.25),
+}
+
 
 def load_scan_table(root=ADNI_ROOT):
     """
@@ -191,21 +199,48 @@ def compute_norm_stats(train_records, seed=SEED, stats_path=_STATS_PATH):
     return mean, std
 
 
-def build_transforms(train, mean, std, img_size=PAD_SIZE, hflip=False):
+class RandomGamma:
+    """
+    Raise intensities in [0, 1] to a random power drawn from [low, high], to
+    mimic differences in scanner contrast. Uses torch's RNG so DataLoader
+    workers are seeded consistently.
+    """
+
+    def __init__(self, low, high):
+        self.low, self.high = low, high
+
+    def __call__(self, img):
+        gamma = torch.empty(1).uniform_(self.low, self.high).item()
+        return img.clamp(0, 1) ** gamma
+
+
+
+def build_transforms(train, mean, std, img_size=PAD_SIZE, hflip=False,
+                     aug="mild"):
     """
     Compose the preprocessing pipeline.
 
     Evaluation: pad -> (resize if img_size != 256) -> normalise.
-    Training adds mild augmentation after padding, so rotations and shifts
-    never crop the brain: small affine (rotation, translation, scale) and
-    brightness/contrast jitter to mimic scanner intensity variation.
+    Training adds augmentation after padding, so rotations and shifts never
+    crop the brain: an affine transform (rotation, translation, scale) and
+    brightness/contrast jitter to mimic scanner intensity variation. aug picks
+    the preset from AUGMENTATIONS; "strong" also adds random gamma and random
+    erasing of small patches (value 0, i.e. background).
     Horizontal flip is off by default because slice or orientation is unverified.
     """
+    if aug not in AUGMENTATIONS:
+        raise ValueError(f"Unknown aug '{aug}'. Choose from {list(AUGMENTATIONS)}")
     steps = [transforms.Lambda(_pad_to_square)]
     if train:
+        deg, trans, scale, jitter, gamma, erase = AUGMENTATIONS[aug]
         steps.append(transforms.RandomAffine(
-        degrees=8, translate=(0.03, 0.03), scale=(0.95, 1.05), fill=0))
-        steps.append(transforms.ColorJitter(brightness=0.1, contrast=0.1))
+            degrees=deg, translate=(trans, trans), scale=scale, fill=0))
+        steps.append(transforms.ColorJitter(brightness=jitter, contrast=jitter))
+        if gamma is not None:
+            steps.append(RandomGamma(*gamma))
+        if erase > 0:
+            steps.append(transforms.RandomErasing(
+                p=erase, scale=(0.02, 0.1), value=0))
         if hflip:
             steps.append(transforms.RandomHorizontalFlip())
 
