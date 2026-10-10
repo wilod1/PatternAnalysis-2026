@@ -583,6 +583,9 @@ def main():
     if a.reject:
         run_reject_analysis(a, loaded)
 
+    if a.agreement:
+        run_agreement(a, loaded)
+
 
 if __name__ == "__main__":
     main()
