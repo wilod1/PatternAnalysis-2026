@@ -296,7 +296,7 @@ def risk_coverage_curve(conf, correct):
     threshold never splits a tie. Arrays run from the highest threshold (low
     coverage) to the lowest (coverage 1.0).
     """
-    order = np.argsort(-conf, king="stable")
+    order = np.argsort(-conf, kind="stable")
     c = conf[order]
     hits = np.cumsum(correct[order])
     n = np.arange(1, len(c) + 1)
