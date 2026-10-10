@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 from torch.utils.data import RandomSampler
+from collections import Counter
 
 from dataset import (ADNISliceDataset, CLASS_TO_INDEX, SEED, build_transforms,
                      collect_samples, split_subjects)
@@ -116,6 +117,33 @@ def save_sample_grid(out_dir=ASSETS, n_cols=5, seed=SEED):
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "augmentation_examples.png"), dpi=130)
     plt.close(fig)
+
+
+def fit_window_baseline(train_records):
+    """
+    Slice-window-only baseline: for each slice window, the share of AD slices
+    among the training records. Uses no image content, so it measures how
+    much accuracy the slice position alone can give.
+    """
+    counts, overall = defaultdict(Counter), Counter()
+    for r in train_records:
+        counts[r["window"]][r["label"]] += 1
+        overall[r["label"]] += 1
+    table = {w: {"n": sum(c.values()), "p_ad": c[1] / sum(c.values())}
+             for w, c in sorted(counts.items())}
+    return {"table": table, "default_p_ad": overall[1] / sum(overall.values())}
+
+
+def window_baseline_probs(model, records):
+    """
+    (N, 2) probabilities [NC, AD] for each record from its window alone. A
+    window never seen in training falls back to the overall training AD share.
+    A 50/50 window predicts NC (argmax picks index 0 on ties).
+    """
+    p_ad = np.array([model["table"].get(r["window"],
+                                        {"p_ad": model["default_p_ad"]})["p_ad"]
+                     for r in records])
+    return np.stack([1 - p_ad, p_ad], axis=1)
 
 
 if __name__ == "__main__":
