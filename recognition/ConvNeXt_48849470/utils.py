@@ -1,6 +1,7 @@
 """
 Helper functions: visualisation, metrics, and profiling.
 """
+import argparse
 import os
 import random
 
@@ -8,11 +9,64 @@ import matplotlib
 matplotlib.use("Agg") # no display on the cluster
 import matplotlib.pyplot as plt
 import torch
+import numpy as np
+from torch.utils.data import RandomSampler
 
 from dataset import (ADNISliceDataset, CLASS_TO_INDEX, SEED, build_transforms,
                      collect_samples, split_subjects)
 
 ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
+# per-slice fields copied from dataset.records into every exported file
+RECORD_FIELDS = ("label", "subject_id", "scan_id", "slice_index", "window", "path")
+
+@torch.no_grad()
+def predict_split(model, loader, device):
+    """
+    Softmax probabilities for every item in an unshuffled loader, shape (N, C).
+    Rows follow the order of loader.dataset.records, so each row can be traced
+    back to its subject, scan and window.
+    """
+    if isinstance(loader.sampler, RandomSampler):
+        raise ValueError("predict_split needs an unshuffled loader so rows "
+                         "line up with dataset.records")
+    model.eval()
+    probs = [torch.softmax(model(x.to(device)), dim=1).cpu() for x, _ in loader]
+    return torch.cat(probs).numpy()
+
+
+def export_predictions(ckpt_path, loaders, out_path, device=None,
+                       splits=("val", "test")):
+    """
+    Rebuild the model stored in a training checkpoint and save its predictions
+    for the given splits to a compressed .npz file.
+
+    For each split the file holds <split>_probs (N, 2), <split>_preds (N,) and
+    one array per field in RECORD_FIELDS (e.g. val_subject_id, test_window).
+    Everything downstream (benchmark, calibration, reject option, failure
+    analysis) reads these files, so no analysis needs a GPU or a retrain.
+    """
+    from train import build_model
+
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model = build_model(ckpt["model"], argparse.Namespace(**ckpt["args"])).to(device)
+    model.load_state_dict(ckpt["state_dict"])
+
+    out = {"epoch": np.asarray(ckpt["epoch"])}
+    for split in splits:
+        loader = loaders[split]
+        records = loader.dataset.records
+        probs = predict_split(model, loader, device)
+        assert len(probs) == len(records), "prediction count != record count"
+        out[f"{split}_probs"] = probs
+        out[f"{split}_preds"] = probs.argmax(1)
+        for field in RECORD_FIELDS:
+            out[f"{split}_{field}"] = np.asarray([r[field] for r in records])
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    np.savez_compressed(out_path, **out)
+    return out
 
 
 def save_sample_grid(out_dir=ASSETS, n_cols=5, seed=SEED):
