@@ -15,7 +15,7 @@ from torchvision.transforms import functional as TF
 from dataset import (build_transforms, collect_samples, compute_norm_stats,
                      split_subjects)
 from metrics import CLASS_NAMES
-from train import build_model, parse_args
+from train import args_from_checkpoint, build_model
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -27,7 +27,7 @@ def load_model(ckpt_path, device):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     saved = ckpt["args"] if isinstance(ckpt["args"], dict) else vars(ckpt["args"])
     name = ckpt["model"]
-    model = build_model(name, parse_args(["--model", name]))
+    model = build_model(name, args_from_checkpoint(ckpt))
     model.load_state_dict(ckpt["state_dict"])
     return model.to(device).eval(), saved
 

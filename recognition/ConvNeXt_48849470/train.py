@@ -2,6 +2,7 @@
 Training, validation, and (optionally) testing for the ADNI classifiers.
 """
 import argparse
+import copy
 import json
 import math
 import os
@@ -17,6 +18,8 @@ from dataset import SEED, get_dataloaders
 from modules import ConvNeXt, SimpleCNN, SimpleResNet
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DEPTHS = (2, 2, 4, 2)
+DEFAULT_DIMS = (32, 64, 128, 256)
 
 
 def set_seed(seed):
@@ -34,11 +37,65 @@ def build_model(name, args):
     builders = {
         "cnn": lambda: SimpleCNN(),
         "resnet": lambda: SimpleResNet(),
-        "convnext": lambda: ConvNeXt(drop_path_rate=args.drop_path),
+        "convnext": lambda: ConvNeXt(
+            drop_path_rate=args.drop_path,
+            depths=tuple(getattr(args, "depths", DEFAULT_DEPTHS)),
+            dims=tuple(getattr(args, "dims", DEFAULT_DIMS))),
     }
     if name not in builders:
         raise ValueError(f"Unknown model '{name}'. Choose from {list(builders)}")
     return builders[name]()
+
+
+def args_from_checkpoint(ckpt):
+    """
+    Rebuild the training arguments stored in a checkpoint, so a model can be
+    reconstructed with the same architecture. Options missing from older
+    checkpoints keep their defaults.
+    """
+    args = parse_args(["--model", ckpt["model"]])
+    for key, value in ckpt["args"].items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+    return args
+
+
+def mixup_batch(x, y, alpha):
+    """
+    Mixup (Zhang et al., 2018): blend each image with another image from the
+    batch using a weight drawn from Beta(alpha, alpha). Returns the mixed
+    batch, both label sets and the weight on the first. alpha <= 0 is a no-op.
+    """
+    if alpha <= 0:
+        return x, y, y, 1.0
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    perm = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[perm], y, y[perm], lam
+
+
+class ModelEMA:
+    """
+    Exponential moving average of a model's weights. The averaged copy
+    (self.module) is used for evaluation: it is smoother than the raw weights,
+    which steadies validation accuracy between epochs. The decay ramps up over
+    the first updates so the average does not start from the random init.
+    """
+
+    def __init__(self, model, decay=0.999):
+        self.module = copy.deepcopy(model).eval()
+        for p in self.module.parameters():
+            p.requires_grad_(False)
+        self.decay = decay
+        self.updates = 0
+
+    @torch.no_grad()
+    def update(self, model):
+        self.updates += 1
+        d = min(self.decay, (1 + self.updates) / (10 + self.updates))
+        for e, m in zip(self.module.parameters(), model.parameters()):
+            e.mul_(d).add_(m.detach(), alpha=1 - d)
+        for e, m in zip(self.module.buffers(), model.buffers()):
+            e.copy_(m)
 
 
 def build_scheduler(optimizer, schedule, epochs, steps_per_epoch, warmup_epochs):
@@ -60,24 +117,36 @@ def build_scheduler(optimizer, schedule, epochs, steps_per_epoch, warmup_epochs)
     return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None):
+def train_one_epoch(model, loader, optimizer, criterion, device, scheduler=None,
+                    mixup_alpha=0.0, ema=None):
     """
     One pass over the training loader. Returns (mean loss, per-slice accuracy).
-    The scheduler, if given, is stepped after every optimiser step.
+    The scheduler, if given, is stepped after every optimiser step. With
+    mixup_alpha > 0 the batch is mixed and the accuracy counts a prediction as
+    correct in proportion to the weight of each label. If ema is given, it is
+    updated after every optimiser step.
     """
     model.train()
-    total_loss, correct, n = 0.0, 0, 0
+    total_loss, correct, n = 0.0, 0.0, 0
     for x, y in loader:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        x, y_a, y_b, lam = mixup_batch(x, y, mixup_alpha)
         optimizer.zero_grad(set_to_none=True)
         logits = model(x)
-        loss = criterion(logits, y)
+        if lam >= 1.0:
+            loss = criterion(logits, y_a)
+        else:
+            loss = lam * criterion(logits, y_a) + (1 - lam) * criterion(logits, y_b)
         loss.backward()
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
+        if ema is not None:
+            ema.update(model)
+        pred = logits.argmax(1)
         total_loss += loss.item() * y.size(0)
-        correct += (logits.argmax(1) == y).sum().item()
+        correct += (lam * (pred == y_a).sum().item()
+                    + (1 - lam) * (pred == y_b).sum().item())
         n += y.size(0)
     return total_loss / n, correct / n
 
@@ -122,9 +191,11 @@ def fit(model, loaders, args, run, device, out_dir=HERE):
     Train model for args.epochs, keeping the checkpoint with the best validation
     accuracy. Writes <out_dir>/results/<run>_history.json after every epoch,
     <out_dir>/assets/<run>_curves.png and <out_dir>/checkpoints/<run>_best.pt
-    (*.pt is git-ignored). Training uses optional label smoothing; validation
-    and test loss are always plain cross-entropy so runs stay comparable.
-    Returns the summary dictionary that is written to the history file.
+    (*.pt is git-ignored). Training uses optional label smoothing and mixup;
+    validation and test loss are always plain cross-entropy so runs stay
+    comparable. With args.ema_decay > 0, validation, checkpoints and test use
+    the exponential moving average of the weights. Returns the summary
+    dictionary that is written to the history file.
     """
     assets = os.path.join(out_dir, "assets")
     results = os.path.join(out_dir, "results")
@@ -143,6 +214,10 @@ def fit(model, loaders, args, run, device, out_dir=HERE):
                                   weight_decay=args.weight_decay)
     scheduler = build_scheduler(optimizer, args.schedule, args.epochs,
                                 len(loaders["train"]), args.warmup_epochs)
+    mixup_alpha = getattr(args, "mixup", 0.0)
+    ema_decay = getattr(args, "ema_decay", 0.0)
+    ema = ModelEMA(model, ema_decay) if ema_decay > 0 else None
+    eval_model = ema.module if ema is not None else model
 
     history = {k: [] for k in ("train_loss", "train_acc", "val_loss", "val_acc",
                                "lr", "epoch_time")}
@@ -154,8 +229,10 @@ def fit(model, loaders, args, run, device, out_dir=HERE):
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         tr_loss, tr_acc = train_one_epoch(model, loaders["train"], optimizer,
-                                          criterion, device, scheduler)
-        va_loss, va_acc = evaluate(model, loaders["val"], eval_criterion, device)
+                                          criterion, device, scheduler,
+                                          mixup_alpha=mixup_alpha, ema=ema)
+        va_loss, va_acc = evaluate(eval_model, loaders["val"], eval_criterion,
+                                   device)
         history["train_loss"].append(tr_loss)
         history["train_acc"].append(tr_acc)
         history["val_loss"].append(va_loss)
@@ -164,7 +241,7 @@ def fit(model, loaders, args, run, device, out_dir=HERE):
         history["epoch_time"].append(time.time() - t0)
         if va_acc > best_acc: # keep the checkpoint with best val accuracy
             best_acc = va_acc
-            torch.save({"model": args.model, "state_dict": model.state_dict(),
+            torch.save({"model": args.model, "state_dict": eval_model.state_dict(),
                         "args": vars(args), "epoch": epoch}, ckpt_path)
         print(f"epoch {epoch:3d} | train loss {tr_loss:.4f} acc {tr_acc:.4f} | "
               f"val loss {va_loss:.4f} acc {va_acc:.4f} | "
@@ -201,7 +278,17 @@ def parse_args(argv=None):
     p.add_argument("--run-name", default=None)
     p.add_argument("--drop-path", type=float, default=0.1,
                    help="ConvNeXt stochastic-depth rate")
+    p.add_argument("--depths", type=int, nargs=4, default=list(DEFAULT_DEPTHS),
+                   help="ConvNeXt blocks per stage")
+    p.add_argument("--dims", type=int, nargs=4, default=list(DEFAULT_DIMS),
+                   help="ConvNeXt channels per stage")
     p.add_argument("--label-smoothing", type=float, default=0.0)
+    p.add_argument("--aug", choices=["mild", "strong"], default="mild",
+                   help="training augmentation preset")
+    p.add_argument("--mixup", type=float, default=0.0,
+                   help="mixup Beta(alpha, alpha); 0 turns it off")
+    p.add_argument("--ema-decay", type=float, default=0.0,
+                   help="EMA of weights used for evaluation; 0 turns it off")
     p.add_argument("--schedule", choices=["constant", "cosine"],
                    default="constant")
     p.add_argument("--warmup-epochs", type=int, default=2,
@@ -220,7 +307,7 @@ def main():
 
     loaders = get_dataloaders(batch_size=args.batch_size, img_size=args.img_size,
                               seed=args.seed, num_workers=args.num_workers,
-                              subset=args.subset)
+                              subset=args.subset, aug=args.aug)
     model = build_model(args.model, args).to(device)
     fit(model, loaders, args, run, device)
 
