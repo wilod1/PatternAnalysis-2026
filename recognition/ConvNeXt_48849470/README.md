@@ -117,3 +117,18 @@ Kernel-size gains saturated at 7×7 in this regime and at 5×5 in the larger one
 | Widths | 96-192-384-768 | 32-64-128-256 | Parameters cut from ~28M to 1.9M to suit the dataset size |
 | Training | AdamW, cosine schedule, 300 epochs, batch 4096 | AdamW, cosine schedule with warmup, 30 epochs, batch 64 | Budget of one A100 and ~12 h queue waits |
 | Heavy augmentation (RandAugment, Mixup, CutMix, EMA) | Used | Not used | Mixing slices is anatomically unrealistic; light affine and intensity jitter instead |
+
+### Training run log (10 Oct 2026)
+
+All runs use the subject-level split (seed 42), the same augmentation and the script defaults (4 CPUs, 4 data-loading workers, 3 h limit, one A100 on the `comp3710` partition). The course allows one running job per user, so the runs execute one after another.
+
+| Run name | Job ID | Model | Command (after `sbatch --job-name=<name> slurm/train.sh`) |
+|---|---|---|---|
+| `cnn` | 646768 | CNN | `--model cnn --epochs 30` (constant LR, pipeline check) |
+| `resnet_cos` | 646842 | ResNet | `--model resnet --epochs 30 --schedule cosine` |
+| `cnn_cos` | 646843 | CNN | `--model cnn --epochs 30 --schedule cosine` |
+| `convnext_a` | 646844 | ConvNeXt | `--model convnext --epochs 30 --schedule cosine --lr 1e-3 --weight-decay 0.05 --drop-path 0.1` |
+| `convnext_b` | 646845 | ConvNeXt | as A with `--lr 5e-4` |
+| `convnext_c` | 646846 | ConvNeXt | as A with `--weight-decay 0.1 --drop-path 0.2 --label-smoothing 0.1` |
+
+The first CNN run (`cnn`) used a constant learning rate and serves as a pipeline check. It trains at about 90 s per epoch, limited by data loading. Its validation accuracy swings between about 0.50 and 0.73 while training accuracy reaches about 0.87, so the cosine-schedule runs form the matched comparison. ConvNeXt B and C each change one thing relative to A (learning rate, regularisation), and the final configuration is chosen on validation accuracy and validation loss only. Parameter counts: CNN about 94k, ResNet 700,146, ConvNeXt 1,899,874.
