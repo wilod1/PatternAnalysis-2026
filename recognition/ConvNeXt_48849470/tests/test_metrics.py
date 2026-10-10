@@ -7,9 +7,10 @@ import pytest
 from metrics import (accuracy_by_window, calibration_summary,
                      classification_metrics, confidence_and_correct,
                      ece_bootstrap_ci, expected_calibration_error,
-                     load_predictions, plot_confidence_histograms,
-                     plot_reliability_diagram, reliability_bins,
-                     subject_bootstrap_ci)
+                     load_predictions, operating_point,
+                     plot_confidence_histograms, plot_reliability_diagram,
+                     plot_risk_coverage, reject_analysis, reliability_bins,
+                     risk_coverage_curve, subject_bootstrap_ci)
 
 
 def test_perfect_predictions():
@@ -144,3 +145,66 @@ def test_calibration_figures_are_written(tmp_path):
     plot_confidence_histograms(runs, tmp_path / "hist.png")
     assert (tmp_path / "rel.png").stat().st_size > 1000
     assert (tmp_path / "hist.png").stat().st_size > 1000
+
+
+def make_conf_data(conf, correct, labels=None):
+    """
+    Build prediction arrays with an exact confidence for every slice.
+    """
+    conf, correct = np.asarray(conf, float), np.asarray(correct, bool)
+    n = len(conf)
+    labels = np.arange(n) % 2 if labels is None else np.asarray(labels)
+    preds = np.where(correct, labels, 1 - labels)
+    probs = np.zeros((n, 2))
+    probs[np.arange(n), preds] = conf
+    probs[np.arange(n), 1 - preds] = 1 - conf
+    return {"probs": probs, "labels": labels, "preds": preds,
+            "subjects": np.arange(n).astype(str), "windows": np.zeros(n, int)}
+
+
+def test_risk_coverage_curve_handles_ties():
+    conf = np.array([0.9, 0.9, 0.8, 0.6])
+    correct = np.array([True, False, True, True])
+    c = risk_coverage_curve(conf, correct)
+    assert c["threshold"].tolist() == [0.9, 0.8, 0.6]
+    assert np.allclose(c["coverage"], [0.5, 0.75, 1.0])
+    assert np.allclose(c["accuracy"], [0.5, 2 / 3, 0.75])
+
+
+def test_operating_point_counts():
+    conf = np.array([0.9, 0.9, 0.8, 0.6])
+    correct = np.array([True, False, True, True])
+    p = operating_point(conf, correct, 0.8)
+    assert p["coverage"] == 0.75 and p["n_accepted"] == 3 and p["n_review"] == 1
+    assert p["accuracy_accepted"] == pytest.approx(2 / 3)
+    assert p["errors_accepted"] == 1 and p["errors_sent_to_review"] == 0
+
+
+def test_reject_analysis_reports_a_missed_target():
+    val = make_conf_data([0.7] * 10, [True] * 5 + [False] * 5)
+    r = reject_analysis(val, target_acc=0.90, min_coverage=0.5)
+    assert not r["target_met_on_val"]
+    assert r["threshold"] == 0.7 and r["val"]["accuracy_accepted"] == 0.5
+
+
+def test_reject_analysis_picks_highest_coverage_meeting_the_target():
+    # 6 right at 0.95, 4 wrong at 0.60: only the 0.95 threshold reaches 90%
+    val = make_conf_data([0.95] * 6 + [0.60] * 4, [True] * 6 + [False] * 4)
+    r = reject_analysis(val, target_acc=0.90, min_coverage=0.5)
+    assert r["target_met_on_val"] and r["threshold"] == 0.95
+    assert r["val"]["coverage"] == 0.6 and r["val"]["accuracy_accepted"] == 1.0
+
+
+def test_reject_threshold_comes_from_val_and_is_applied_to_test():
+    val = make_conf_data([0.95] * 6 + [0.60] * 4, [True] * 6 + [False] * 4)
+    test = make_conf_data([0.95, 0.95, 0.6, 0.6], [True, False, True, True])
+    r = reject_analysis(val, test, 0.90, 0.5)
+    assert r["threshold"] == 0.95  # unchanged by the test data
+    assert r["test"]["coverage"] == 0.5 and r["test"]["accuracy_accepted"] == 0.5
+    assert r["test"]["errors_accepted"] == 1
+
+
+def test_risk_coverage_figure_is_written(tmp_path):
+    runs = {"cnn_cos": make_data(see=1), "resnet_cos": make_data(seed=2)}
+    plot_risk_coverage(runs, tmp_path / "rc.png", points={"cnn_cos": (0.6, 0.8)})
+    assert (tmp_path / "rc.png").stat().st_size > 1000
