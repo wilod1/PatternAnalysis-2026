@@ -205,6 +205,6 @@ def test_reject_threshold_comes_from_val_and_is_applied_to_test():
 
 
 def test_risk_coverage_figure_is_written(tmp_path):
-    runs = {"cnn_cos": make_data(see=1), "resnet_cos": make_data(seed=2)}
+    runs = {"cnn_cos": make_data(seed=1), "resnet_cos": make_data(seed=2)}
     plot_risk_coverage(runs, tmp_path / "rc.png", points={"cnn_cos": (0.6, 0.8)})
     assert (tmp_path / "rc.png").stat().st_size > 1000
