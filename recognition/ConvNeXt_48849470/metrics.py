@@ -20,15 +20,19 @@ CLASS_NAMES = ("nc", "ad")
 
 def load_predictions(path, split):
     """
-    Load one split from a prediction file as plain arrays.
+    Load one split from a prediction file as plain arrays. A window stored as a
+    tuple such as (start, end) is turned into a single label like "60-80".
     """
     data = np.load(path)
+    windows = data[f"{split}_window"]
+    if windows.ndim > 1:
+        windows = np.array(["-".join(str(v) for v in row) for row in windows])
     return {
         "probs": data[f"{split}_probs"],
         "preds": data[f"{split}_preds"],
         "labels": data[f"{split}_label"],
         "subjects": data[f"{split}_subject_id"],
-        "windows": data[f"{split}_window"],
+        "windows": windows,
     }
 
 

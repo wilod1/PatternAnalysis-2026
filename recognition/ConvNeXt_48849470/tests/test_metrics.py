@@ -78,3 +78,12 @@ def test_load_predictions_reads_one_split(tmp_path):
              val_window=np.array([4]))
     d = load_predictions(path, "val")
     assert d["labels"].tolist() == [1] and d["subjects"].tolist() == ["s1"]
+
+def test_load_predictions_flattens_tuple_windows(tmp_path):
+    path = tmp_path / "preds_x.npz"
+    np.savez(path, val_probs=np.array([[0.7, 0.3], [0.2, 0.8]]),
+             val_preds=np.array([0, 1]), val_label=np.array([0, 1]),
+             val_subject_id=np.array(["s1", "s2"]),
+             val_window=np.array([[60, 80], [80, 100]]))
+    d = load_predictions(path, "val")
+    assert d["windows"].tolist() == ["60-80", "80-100"]
