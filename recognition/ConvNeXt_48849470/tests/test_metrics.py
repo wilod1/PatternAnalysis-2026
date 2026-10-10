@@ -10,7 +10,7 @@ from metrics import (accuracy_by_window, calibration_summary,
                      load_predictions, operating_point,
                      plot_confidence_histograms, plot_reliability_diagram,
                      plot_risk_coverage, reject_analysis, reliability_bins,
-                     risk_coverage_curve, subject_bootstrap_ci)
+                     risk_coverage_curve, subject_bootstrap_ci, agreement_analysis)
 
 
 def test_perfect_predictions():
@@ -208,3 +208,44 @@ def test_risk_coverage_figure_is_written(tmp_path):
     runs = {"cnn_cos": make_data(seed=1), "resnet_cos": make_data(seed=2)}
     plot_risk_coverage(runs, tmp_path / "rc.png", points={"cnn_cos": (0.6, 0.8)})
     assert (tmp_path / "rc.png").stat().st_size > 1000
+
+
+def make_pred_data(wrong_idx, labels=(0, 1, 0, 1, 0, 1),
+                   subjects=("s1", "s1", "s2", "s2", "s3", "s3"),
+                   windows=(0, 0, 0, 1, 1, 1)):
+    """
+    Predictions that are wrong exactly at wrong_idx.
+    """
+    labels = np.array(labels)
+    preds = labels.copy()
+    for i in wrong_idx:
+        preds[i] = 1 - preds[i]
+    return {"labels": labels, "preds": preds, "subjects": np.array(subjects),
+            "windows": np.array(windows)}
+
+
+def test_agreement_analysis_hand_example():
+    runs = {"A": make_pred_data([0, 1]), "B": make_pred_data([1, 2]),
+            "C": make_pred_data([1])}
+    r = agreement_analysis(runs, reference="C", top_subjects=1)
+    assert r["n_slices_wrong_by_k"] == {"0": 3, "1": 2, "2": 0, "3": 1}
+    assert r["pairs"]["A & B"]["both_wrong"] == 1
+    assert r["pairs"]["A & B"]["jaccard"] == pytest.approx(1 / 3)
+    assert r["pairs"]["A & C"]["jaccard"] == pytest.approx(0.5)
+    assert r["reference_errors_also_made_by"] == {"A": 1.0, "B": 1.0}
+    w0 = r["by_window"]["0"]
+    assert w0["error_rate"]["C"] == pytest.approx(1 / 3)
+    assert w0["wrong_by_all"] == pytest.approx(1 / 3)
+    assert r["by_window"]["1"]["wrong_by_all"] == 0.0
+    assert r["hard_subjects"][0]["subject"] == "s1"
+    assert r["hard_subjects"][0]["class"] == "NC"
+    c = r["reference_error_concentration"]
+    assert c["share_of_errors"] == 1.0 and c["n_subjects"] == 3
+    assert c["subjects_over_half_wrong"] == 0  # s1 is exactly half wrong for C
+
+
+def test_agreement_rejects_mismatched_splits():
+    runs = {"A": make_pred_data([0]),
+            "B": make_pred_data([0], labels=(1, 1, 0, 1, 0, 1))}
+    with pytest.raises(ValueError):
+        agreement_analysis(runs)
