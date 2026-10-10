@@ -103,3 +103,17 @@ Kernel-size gains saturated at 7×7 in this regime and at 5×5 in the larger one
 - Setup: SimpleCNN trained for 3 epochs on a random subset of slices (2,000 per split) as a pipeline check.
 - Result: data loading, model, training loop, checkpointing and curve plotting ran end to end without errors. The run's loss, accuracy and timing values were not retained. Accuracy at this scale is not meaningful, so the test only shows that the pipeline is operational.
 - Next: the full baseline CNN run (Phase 4) is the first logged result.
+
+### ConvNeXt: retained from the paper vs shrunk
+
+| Component | Paper (ConvNeXt-T) | This project | Why |
+|---|---|---|---|
+| Patchify stem | 4x4 conv, stride 4 | Retained (1 input channel) | Core design choice; also cuts compute on 256x256 slices |
+| Block | 7x7 depthwise conv, LayerNorm, 4x inverted bottleneck, GELU | Retained | Core design |
+| Layer scale | init 1e-6 | Retained | Stabilises training of a from-scratch network |
+| Stochastic depth | linear rise to 0.1 | Retained, rate set per run | Main regulariser against overfitting 476 training subjects |
+| Downsampling | separate LayerNorm + 2x2 stride-2 conv | Retained | Core design |
+| Stage layout | 4 stages, depths 3-3-9-3 | 4 stages, depths 2-2-4-2 | Same shape, fewer blocks for ~21k training slices |
+| Widths | 96-192-384-768 | 32-64-128-256 | Parameters cut from ~28M to 1.9M to suit the dataset size |
+| Training | AdamW, cosine schedule, 300 epochs, batch 4096 | AdamW, cosine schedule with warmup, 30 epochs, batch 64 | Budget of one A100 and ~12 h queue waits |
+| Heavy augmentation (RandAugment, Mixup, CutMix, EMA) | Used | Not used | Mixing slices is anatomically unrealistic; light affine and intensity jitter instead |
