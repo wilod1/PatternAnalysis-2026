@@ -417,6 +417,114 @@ def run_reject_analysis(a, loaded):
     print("saved reject-option json and figure")
 
 
+def agreement_analysis(runs_data, reference=None, top_subjects=10):
+    """
+    Do the models fail on the same slices, and do errors cluster in a few
+    subjects? All runs must be predictions for the same split (same slices in
+    the same order). The reference run (default: the last one listed) is the
+    model whose errors are examined most closely, e.g. the ConvNeXt.
+    """
+    runs = list(runs_data)
+    first = runs_data[runs[0]]
+    for r in runs[1:]:
+        for key in ("labels", "subjects", "windows"):
+            if not np.array_equal(runs_data[r][key], first[key]):
+                raise ValueError(f"{r} and {runs[0]} disagree on '{key}': "
+                                 "prediction files must be from the same split")
+        reference = reference or runs[-1]
+        labels = first["labels"]
+        wrong = {r: runs_data[r]["preds"] != labels for r in runs}
+    n_wrong = np.sum([wrong[r] for r in runs], axis=0)  # models wrong per slice
+
+    pairs = {}
+    for i, a in enumerate(runs):
+        for b in runs[i + 1]:
+            both = int((wrong[a] & wrong[b]).sum())
+            union = int((wrong[a] | wrong[b]).sum())
+            pairs[f"{a} & {b}"] = {
+                "both_wrong": both,
+                "only_first": int((wrong[a] & ~wrong[b]).sum()),
+                "only_second": int((wrong[b] & ~wrong[a]).sum()),
+                "jaccard": both / union if union else float("nan"),
+            }
+
+    ref_wrong = wrong[reference]
+    n_ref = int(ref_wrong.sum())
+    shared = {r: (float((ref_wrong & wrong[r]).sum() / n_ref)
+                  if n_ref else float("nan"))
+              for r in runs if r != reference}
+
+    by_window = {}
+    for w in np.unique(first["windows"]):
+        m = first["windows"] == w
+        by_window[str(w)] = {
+            "n": int(m.sum()),
+            "error_rate": {r: float(wrong[r][m].mean()) for r in runs},
+            "wrong_by_all": float((n_wrong[m] == len(runs)).mean()),
+        }
+
+    subjects, inverse = np.unique(first["subjects"], return_inverse=True)
+    n_per = np.bincount(inverse)
+    rates = {r: np.bincount(inverse, weights=wrong[r].astype(float)) / n_per
+             for r in runs}
+    mean_rate = np.mean([rates[r] for r in runs], axis=0)
+    hard = []
+    for k in np.argsort(-mean_rate, kind="stable")[:top_subjects]:
+        label = int(labels[inverse == k][0])  # a subject has a single class
+        hard.append({"subject": str(subjects[k]),
+                     "class": CLASS_NAMES[label].upper(),
+                     "n": int(n_per[k]),
+                     "mean_error_rate": float(mean_rate[k]),
+                     "error_rate": {r: float(rates[r][k]) for r in runs}})
+
+    ref_errors = np.bincount(inverse, weights=ref_wrong.astype(float))
+    top = np.sort(ref_errors)[::-1][:top_subjects]
+    concentration = {
+        "top_subjects": top_subjects,
+        "share_of_errors": (float(top.sum() / ref_errors.sum())
+                            if ref_errors.sum() else float("nan")),
+        "subjects_over_half_wrong": int((rates[reference] > 0.5).sum()),
+        "n_subjects": int(len(subjects)),
+    }
+    return {
+        "runs": runs,
+        "reference": reference,
+        "n_slices": int(len(labels)),
+        "n_slices_wrong_by_k": {str(k): int((n_wrong == k).sum())
+                                for k in range(len(runs) + 1)},
+        "pairs": pairs,
+        "reference_errors_also_made_by": shared,
+        "by_window": by_window,
+        "hard_subjects": hard,
+        "reference_error_concentration": concentration,
+    }
+
+
+def run_agreement(a, loaded):
+    """
+    Agreement analysis for the runs given on the command line; prints a summary
+    and writes results/agreement_<split>.json.
+    """
+    if len(loaded) < 2:
+        raise SystemExit("--agreement needs at least two runs")
+    out = agreement_analysis(loaded, a.reference)
+    ref = out["reference"]
+    print(f"agreement on {a.split}: {out['n_slices']} slices, reference = {ref}")
+    print("slices wrong by k models:", out["n_slices_wrong_by_k"])
+    for pair, v in out["pairs"].items():
+        print(f"  {pair:32s} both wrong {v['both_wrong']:5d}  "
+              f"jaccard {v['jaccard']:.3f}")
+    for run, share in out["reference_errors_also_made_by"].items():
+        print(f"  {share:.3f} of {ref}'s errors are also made by {run}")
+    c = out["reference_error_concentration"]
+    print(f"  worst {c['top_subjects']} subjects hold {c['share_of_errors']:.3f} "
+          f"of {ref}'s errors; {c['subjects_over_half_wrong']} of "
+          f"{c['n_subjects']} subjects have over half their slices wrong")
+    with open(os.path.join(HERE, "results", f"agreement_{a.split}.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    print("saved agreement json")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--runs", nargs="+", required=True,
@@ -432,6 +540,10 @@ def main():
                    help="accuracy wanted on accepted slices")
     p.add_argument("--min-coverage", type=float, default=0.5,
                    help="smallest acceptable share decided automatically")
+    p.add_argument("--agreement", action="store_true",
+                   help="also compare which slices the runs get wrong")
+    p.add_argument("--reference", default=None,
+                   help="run whose errors are examined (default: last in --runs)")
     a = p.parse_args()
 
     results, loaded = {}, {}
