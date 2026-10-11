@@ -199,19 +199,26 @@ def save_checkpoint(
     )
 
 
+
 def write_history(path, history, args):
     """Save the experiment configuration and epoch metrics as JSON."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    config = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+
     with path.open("w", encoding="utf-8") as file:
         json.dump(
             {
-                "config": vars(args),
+                "config": config,
                 "history": history,
             },
             file,
             indent=2,
         )
+
 
 
 # ---------------------------------------------------------------------
