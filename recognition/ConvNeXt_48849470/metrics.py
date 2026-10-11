@@ -525,6 +525,167 @@ def run_agreement(a, loaded):
     print("saved agreement json")
 
 
+def subject_level_accuracy(data, n_boot=1000, seed=0):
+    """
+    Classify each subject by the mean class-1 probability over all of that
+    subject's slices. Returns subject accuracy with a 95% bootstrap interval
+    (resampling subjects), accuracy per true class, and the slice accuracy
+    obtained when every slice takes its subject's vote. This is an extra
+    metric: the headline accuracy in this project is per slice.
+    """
+    probs = data["probs"]
+    p1 = probs[:, 1] if probs.ndim == 2 else probs
+    subjects, inverse = np.unique(data["subjects"], return_inverse=True)
+    n_per = np.bincount(inverse)
+    labels = np.asarray(data["labels"])
+    class1 = np.bincount(inverse, weights=(labels == 1).astype(float))
+    if not np.all((class1 == 0) | (class1 == n_per)):
+        raise ValueError("a subject has slices from both classes")
+    sub_labels = (class1 > 0).astype(int)
+    mean_p1 = np.bincount(inverse, weights=p1) / n_per
+    correct = ((mean_p1 > 0.5).astype(int) == sub_labels).astype(float)
+
+    rng = np.random.default_rng(seed)
+    boots = [correct[rng.integers(0, len(correct), len(correct))].mean()
+             for _ in range(n_boot)]
+    return {
+        "n_subjects": int(len(subjects)),
+        "accuracy": float(correct.mean()),
+        "ci95": [float(np.percentile(boots, 2.5)),
+                 float(np.percentile(boots, 97.5))],
+        "accuracy_by_class": {
+            str(CLASS_NAMES[c]).lower(): float(correct[sub_labels == c].mean())
+            for c in (0, 1) if (sub_labels == c).any()},
+        "slice_accuracy_with_vote": float(correct[inverse].mean()),
+    }
+
+
+def window_majority_check(data):
+    """
+    For every slice window, compare the model's accuracy with that window's
+    majority-class rate. Only windows containing both classes are 'mixed'; a
+    model beats the shortcut in a window only if its accuracy is strictly
+    higher than the majority rate there.
+    """
+    labels, windows, preds = data["labels"], data["windows"], data["preds"]
+    rows = []
+    for w in np.unique(windows):
+        m = windows == w
+        counts = np.bincount(labels[m], minlength=2)
+        majority = counts.max() / counts.sum()
+        acc = float((preds[m] == labels[m]).mean())
+        rows.append({"window": str(w), "n": int(m.sum()),
+                     "n_by_class": [int(c) for c in counts],
+                     "mixed": bool((counts > 0).all()),
+                     "majority_rate": float(majority), "accuracy": acc,
+                     "beats_majority": bool(acc > majority)})
+    mixed = [r for r in rows if r["mixed"]]
+    return {"windows": rows, "n_mixed": len(mixed),
+            "n_beating_majority": sum(r["beats_majority"] for r in mixed),
+            "all_mixed_beaten": all(r["beats_majority"] for r in mixed)}
+
+
+def run_subject_level(a, loaded):
+    """
+    Subject-level accuracy for each run; prints a summary and writes
+    results/subject_level_<split>.json.
+    """
+    out = {run: subject_level_accuracy(d, a.n_boot) for run, d in loaded.items()}
+    for run, r in out.items():
+        by_class = ", ".join(f"{k} {v:.3f}" for k, v in r["accuracy_by_class"].items())
+        print(f"{run:14s} subject acc {r['accuracy']:.3f} "
+              f"[{r['ci95'][0]:.3f}, {r['ci95'][1]:.3f}] "
+              f"({r['n_subjects']} subjects; {by_class}); "
+              f"slice acc with subject vote {r['slice_accuracy_with_vote']:.3f}")
+    with open(os.path.join(HERE, "results", f"subject_level_{a.split}.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    print("saved subject-level json")
+
+
+def run_window_check(a, loaded):
+    """
+    Within-window comparison with the majority-class rate for each run; prints
+    a table (a * marks a window where the model beats the majority rate) and
+    writes results/window_check_<split>.json.
+    """
+    out = {run: window_majority_check(d) for run, d in loaded.items()}
+    runs = list(out)
+    first = out[runs[0]]["windows"]
+    print(f"{'window':>10s} {'n':>6s} {'majority':>9s}  " +
+          "  ".join(f"{r[:12]:>12s}" for r in runs))
+    for i, w in enumerate(first):
+        if not w["mixed"]:
+            continue
+        cells = []
+        for r in runs:
+            row = out[r]["windows"][i]
+            cells.append(f"{row['accuracy']:11.3f}{'*' if row['beats_majority'] else ' '}")
+        print(f"{w['window']:>10s} {w['n']:6d} {w['majority_rate']:9.3f}  " +
+              "  ".join(cells))
+    for r in runs:
+        o = out[r]
+        print(f"  {r}: beats the majority rate in {o['n_beating_majority']} of "
+              f"{o['n_mixed']} mixed windows")
+    with open(os.path.join(HERE, "results", f"window_check_{a.split}.json"), "w") as f:
+        json.dump(out, f, indent=2)
+    print("saved window check json")
+
+
+def paired_bootstrap_diff(data_a, data_b, n_boot=2000, seed=0):
+    """
+    Slice accuracy of run A minus run B, with a 95% interval from resampling
+    subjects. Both runs are scored on the same resampled subjects, so shared
+    difficulty cancels and the interval is much tighter than comparing two
+    separate intervals. p_a_better is the fraction of resamples in which A is
+    strictly more accurate.
+    """
+    for key in ("labels", "subjects"):
+        if not np.array_equal(data_a[key], data_b[key]):
+            raise ValueError(f"runs disagree on '{key}': not the same split")
+    labels = data_a["labels"]
+    subjects, inverse = np.unique(data_a["subjects"], return_inverse=True)
+    n_per = np.bincount(inverse).astype(float)
+
+    def correct_per_subject(data):
+        return np.bincount(inverse, weights=(data["preds"] == labels).astype(float))
+
+    right_a, right_b = correct_per_subject(data_a), correct_per_subject(data_b)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(subjects), size=(n_boot, len(subjects)))
+    total = n_per[idx].sum(axis=1)
+    diffs = (right_a[idx].sum(axis=1) - right_b[idx].sum(axis=1)) / total
+    acc_a, acc_b = right_a.sum() / n_per.sum(), right_b.sum() / n_per.sum()
+    return {"acc_a": float(acc_a), "acc_b": float(acc_b),
+            "diff": float(acc_a - acc_b),
+            "ci95": [float(np.percentile(diffs, 2.5)),
+                     float(np.percentile(diffs, 97.5))],
+            "p_a_better": float((diffs > 0).mean())}
+
+
+def run_paired(a, loaded):
+    """
+    Compare the reference run with every other run (reference minus other);
+    prints a summary and writes results/paired_<split>.json.
+    """
+    ref = a.paired
+    if ref not in loaded:
+        raise SystemExit(f"--paired {ref} must be one of --runs")
+    out = {}
+    for run, data in loaded.items():
+        if run == ref:
+            continue
+        r = paired_bootstrap_diff(loaded[ref], data, a.n_boot)
+        out[run] = r
+        verdict = ("clear" if r["ci95"][0] > 0 or r["ci95"][1] < 0
+                   else "not distinguishable from zero")
+        print(f"{ref} - {run:14s} diff {r['diff']:+.3f} "
+              f"[{r['ci95'][0]:+.3f}, {r['ci95'][1]:+.3f}]  "
+              f"P({ref} better) {r['p_a_better']:.2f}  ({verdict})")
+    with open(os.path.join(HERE, "results", f"paired_{a.split}.json"), "w") as f:
+        json.dump({"reference": ref, "comparisons": out}, f, indent=2)
+    print("saved paired json")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--runs", nargs="+", required=True,
@@ -544,6 +705,12 @@ def main():
                    help="also compare which slices the runs get wrong")
     p.add_argument("--reference", default=None,
                    help="run whose errors are examined (default: last in --runs)")
+    p.add_argument("--subject-level", action="store_true",
+                   help="also report subject-level accuracy")
+    p.add_argument("--window-check", action="store_true",
+                   help="also compare each window with its majority-class rate")
+    p.add_argument("--paired", default=None, metavar="RUN",
+                   help="paired bootstrap of this run against every other run")
     a = p.parse_args()
 
     results, loaded = {}, {}
@@ -585,6 +752,15 @@ def main():
 
     if a.agreement:
         run_agreement(a, loaded)
+
+    if a.subject_level:
+        run_subject_level(a, loaded)
+
+    if a.window_check:
+        run_window_check(a, loaded)
+
+    if a.paired:
+        run_paired(a, loaded)
 
 
 if __name__ == "__main__":

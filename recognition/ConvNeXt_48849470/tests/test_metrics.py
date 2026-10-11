@@ -10,7 +10,8 @@ from metrics import (accuracy_by_window, calibration_summary,
                      load_predictions, operating_point,
                      plot_confidence_histograms, plot_reliability_diagram,
                      plot_risk_coverage, reject_analysis, reliability_bins,
-                     risk_coverage_curve, subject_bootstrap_ci, agreement_analysis)
+                     risk_coverage_curve, subject_bootstrap_ci, agreement_analysis,
+                     subject_level_accuracy, window_majority_check, paired_bootstrap_diff)
 
 
 def test_perfect_predictions():
@@ -249,3 +250,75 @@ def test_agreement_rejects_mismatched_splits():
             "B": make_pred_data([0], labels=(1, 1, 0, 1, 0, 1))}
     with pytest.raises(ValueError):
         agreement_analysis(runs)
+
+
+def test_subject_level_accuracy_hand_example():
+    # s1 (NC) votes NC although slice 0 is wrong; s2 (AD) votes AD although two
+    # slices are wrong; s3 (NC) votes AD, so the subject is wrong
+    p1 = np.array([0.9, 0.1, 0.2, 0.4, 0.45, 0.9, 0.7, 0.8, 0.1])
+    data = {"probs": np.stack([1 - p1, p1], axis=1),
+            "labels": np.array([0, 0, 0, 1, 1, 1, 0, 0, 0]),
+            "subjects": np.array(["s1"] * 3 + ["s2"] * 3 + ["s3"] * 3)}
+    r = subject_level_accuracy(data, n_boot=200)
+    assert r["n_subjects"] == 3
+    assert r["accuracy"] == pytest.approx(2 / 3)
+    assert r["accuracy_by_class"] == {"nc": 0.5, "ad": 1.0}
+    assert r["slice_accuracy_with_vote"] == pytest.approx(6 / 9)
+    assert r["ci95"][0] <= r["accuracy"] <= r["ci95"][1]
+    data["probs"] = p1  # a 1-D class-1 probability gives the same answer
+    assert subject_level_accuracy(data, n_boot=10)["accuracy"] == pytest.approx(2 / 3)
+
+
+def test_subject_level_rejects_mixed_subject():
+    data = {"probs": np.full((2, 2), 0.5), "labels": np.array([0, 1]),
+            "subjects": np.array(["s1", "s1"])}
+    with pytest.raises(ValueError):
+        subject_level_accuracy(data)
+
+
+def test_window_majority_check_hand_example():
+    data = {"labels": np.array([0, 0, 0, 1, 0, 1, 1, 1, 0, 0]),
+            "preds": np.array([0, 0, 0, 1, 0, 0, 1, 0, 0, 0]),
+            "windows": np.array(["a"] * 4 + ["b"] * 4 + ["c"] * 2)}
+    r = window_majority_check(data)
+    by = {w["window"]: w for w in r["windows"]}
+    assert by["a"]["majority_rate"] == 0.75 and by["a"]["accuracy"] == 1.0
+    assert by["a"]["beats_majority"]
+    assert by["b"]["accuracy"] == 0.5 and not by["b"]["beats_majority"]
+    assert not by["c"]["mixed"]
+    assert r["n_mixed"] == 2 and r["n_beating_majority"] == 1
+    assert not r["all_mixed_beaten"]
+
+
+def make_paired_data(wrong_idx):
+    labels = np.array([0, 0, 1, 1, 0, 0, 1, 1])
+    preds = labels.copy()
+    for i in wrong_idx:
+        preds[i] = 1 - preds[i]
+    return {"labels": labels, "preds": preds,
+            "subjects": np.array(["s1"] * 2 + ["s2"] * 2 + ["s3"] * 2 + ["s4"] * 2)}
+
+
+def test_paired_bootstrap_hand_example():
+    # A is always right; B is wrong on both slices of s1, so A beats B by 2/8
+    a, b = make_paired_data([]), make_paired_data([0, 1])
+    r = paired_bootstrap_diff(a, b, n_boot=2000)
+    assert r["acc_a"] == 1.0 and r["acc_b"] == 0.75
+    assert r["diff"] == pytest.approx(0.25)
+    assert r["ci95"][0] <= r["diff"] <= r["ci95"][1]
+    # A is better unless s1 is never drawn: probability 1 - (3/4)^4 = 0.68
+    assert 0.6 < r["p_a_better"] < 0.77
+
+
+def test_paired_bootstrap_identical_runs_have_zero_difference():
+    a = make_paired_data([2])
+    r = paired_bootstrap_diff(a, make_paired_data([2]), n_boot=200)
+    assert r["diff"] == 0.0 and r["ci95"] == [0.0, 0.0] and r["p_a_better"] == 0.0
+
+
+def test_paired_bootstrap_rejects_different_splits():
+    a = make_paired_data([])
+    b = make_paired_data([])
+    b["subjects"] = np.array(["t"] * 8)
+    with pytest.raises(ValueError):
+        paired_bootstrap_diff(a, b)
