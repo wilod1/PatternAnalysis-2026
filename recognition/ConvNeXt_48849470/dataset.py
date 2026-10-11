@@ -240,7 +240,7 @@ def build_transforms(train, mean, std, img_size=PAD_SIZE, hflip=False,
             steps.append(RandomGamma(*gamma))
         if erase > 0:
             steps.append(transforms.RandomErasing(
-                p=erase, scale=(0.02, 0.1), value=0))
+                p=erase, scale=(0.01, 0.04), value=0))
         if hflip:
             steps.append(transforms.RandomHorizontalFlip())
 
