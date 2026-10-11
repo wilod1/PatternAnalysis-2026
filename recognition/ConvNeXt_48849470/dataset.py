@@ -1,4 +1,3 @@
-
 """
 Dataset utilities for ADNI Alzheimer's disease classification.
 
@@ -50,6 +49,16 @@ STATS_PATH = RESULTS_DIR / "norm_stats.json"
 AUGMENTATIONS = {
     "mild": (8, 0.03, (0.95, 1.05), 0.10, None, 0.00),
     "strong": (15, 0.08, (0.85, 1.15), 0.30, (0.70, 1.50), 0.25),
+}
+
+# "strong_blur" is "strong" plus a random Gaussian blur.
+AUGMENTATIONS["strong_blur"] = AUGMENTATIONS["strong"]
+
+# preset -> (kernel_size, sigma range, probability); None means no blur.
+BLUR = {
+    "mild": None,
+    "strong": None,
+    "strong_blur": (5, (0.3, 1.2), 0.5),
 }
 
 
@@ -475,6 +484,15 @@ def build_transforms(
             contrast=jitter,
         ))
 
+        blur = BLUR.get(aug)
+
+        if blur is not None:
+            kernel, sigma, probability = blur
+            steps.append(transforms.RandomApply(
+                [transforms.GaussianBlur(kernel_size=kernel, sigma=sigma)],
+                p=probability,
+            ))
+
         if gamma is not None:
             steps.append(RandomGamma(*gamma))
 
@@ -630,6 +648,7 @@ def get_dataloaders(
             dataset,
             batch_size=batch_size,
             shuffle=training,
+            drop_last=training and len(dataset) > batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=num_workers > 0,

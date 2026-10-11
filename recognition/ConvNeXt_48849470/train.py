@@ -1,4 +1,3 @@
-
 """
 Train and evaluate a ConvNeXt model for ADNI MRI slice classification.
 
@@ -8,28 +7,40 @@ Classes:
 
 The training and validation sets are used for model development.
 The test set is not evaluated unless --eval-test is explicitly supplied.
+
+Training choices aimed at a small, subject-limited dataset:
+    - a size preset (--variant) instead of a fixed 28M-parameter model
+    - exponential moving average (EMA) of the weights, used for validation
+    - no weight decay on norm scales, biases or layer-scale parameters
+    - a plain (unsmoothed) cross-entropy for validation and test loss
 """
 
 import argparse
+import copy
 import json
+import os
 import random
 import time
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")  # no display on the cluster
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 
-from dataset import get_dataloaders
-from modules import ConvNeXt
+from dataset import AUGMENTATIONS, get_dataloaders
+from modules import CONVNEXT_VARIANTS, ConvNeXt
 
 
 # ---------------------------------------------------------------------
 # Reproducibility
 # ---------------------------------------------------------------------
 
-def set_seed(seed):
-    """Set random seeds for reproducible experiments."""
+def set_seed(seed, deterministic=False):
+    """Seed all generators. cuDNN autotuning is on unless deterministic."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -37,111 +48,71 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # Prefer reproducibility over potentially nondeterministic algorithms.
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
 
 
 # ---------------------------------------------------------------------
-# Training and evaluation
+# Weight averaging
 # ---------------------------------------------------------------------
 
-def calculate_accuracy(logits, labels):
-    """Calculate the number of correctly classified samples."""
-    predictions = logits.argmax(dim=1)
-    correct = (predictions == labels).sum().item()
-    return correct
-
-
-def run_epoch(
-    model,
-    loader,
-    criterion,
-    device,
-    optimizer=None,
-    scaler=None,
-    amp_enabled=False,
-    max_grad_norm=1.0,
-):
+class ModelEMA:
     """
-    Run one training or evaluation epoch.
+    Exponential moving average of a model's weights.
 
-    Passing an optimizer enables training. Without an optimizer, gradients
-    are disabled and the model is evaluated.
+    The decay ramps up from a small value so the average is useful early in
+    training. The averaged copy is what gets validated and checkpointed.
     """
-    training = optimizer is not None
-    model.train(training)
 
-    total_loss = 0.0
-    total_correct = 0
-    total_samples = 0
+    def __init__(self, model, decay):
+        self.module = copy.deepcopy(model).eval()
 
-    context = torch.enable_grad if training else torch.no_grad
+        for parameter in self.module.parameters():
+            parameter.requires_grad_(False)
 
-    with context():
-        for images, labels in loader:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+        self.decay = decay
+        self.updates = 0
 
-            if training:
-                optimizer.zero_grad(set_to_none=True)
+    @torch.no_grad()
+    def update(self, model):
+        self.updates += 1
+        decay = min(self.decay, (1 + self.updates) / (10 + self.updates))
 
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.float16,
-                enabled=amp_enabled,
-            ):
-                logits = model(images)
-                loss = criterion(logits, labels)
+        source = model.state_dict().values()
+        target = self.module.state_dict().values()
 
-            if training:
-                if scaler is not None and scaler.is_enabled():
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-
-                    if max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), max_grad_norm
-                        )
-
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-
-                    if max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(), max_grad_norm
-                        )
-
-                    optimizer.step()
-
-            batch_size = labels.size(0)
-            total_loss += loss.detach().item() * batch_size
-            total_correct += calculate_accuracy(logits.detach(), labels)
-            total_samples += batch_size
-
-    if total_samples == 0:
-        raise RuntimeError("The DataLoader produced no samples.")
-
-    return {
-        "loss": total_loss / total_samples,
-        "accuracy": total_correct / total_samples,
-        "samples": total_samples,
-    }
+        for ema_value, value in zip(target, source):
+            if ema_value.dtype.is_floating_point:
+                ema_value.mul_(decay).add_(value.detach(), alpha=1.0 - decay)
+            else:
+                ema_value.copy_(value)
 
 
 # ---------------------------------------------------------------------
-# Learning-rate schedule
+# Optimiser and learning-rate schedule
 # ---------------------------------------------------------------------
 
-def learning_rate_at_step(
-    step,
-    total_steps,
-    warmup_steps,
-    base_lr,
-    min_lr,
-):
+def build_optimizer(model, lr, weight_decay):
+    """AdamW with weight decay on weight matrices and kernels only."""
+    decay, no_decay = [], []
+
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+
+        # Norm scales, biases and layer-scale vectors are one-dimensional.
+        (no_decay if parameter.ndim <= 1 else decay).append(parameter)
+
+    return torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=lr,
+    )
+
+
+def learning_rate_at_step(step, total_steps, warmup_steps, base_lr, min_lr):
     """
     Linear warm-up followed by cosine decay.
 
@@ -161,128 +132,277 @@ def learning_rate_at_step(
 
 
 # ---------------------------------------------------------------------
-# Checkpoint and history utilities
+# Training and evaluation
 # ---------------------------------------------------------------------
+
+def count_correct(logits, labels):
+    """Number of correctly classified samples in a batch."""
+    return (logits.argmax(dim=1) == labels).sum().item()
+
+
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    scaler,
+    device,
+    amp_enabled,
+    args,
+    total_steps,
+    warmup_steps,
+    global_step,
+    ema=None,
+):
+    """One pass over the training loader. Returns (metrics, step, last lr)."""
+    model.train()
+
+    loss_sum = 0.0
+    correct = 0
+    samples = 0
+    lr = args.lr
+
+    for images, labels in loader:
+        lr = learning_rate_at_step(
+            step=global_step,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            base_lr=args.lr,
+            min_lr=args.min_lr,
+        )
+
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=amp_enabled,
+        ):
+            logits = model(images)
+            loss = criterion(logits, labels)
+
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+
+            if args.max_grad_norm > 0:
+                nn.utils.clip_grad_norm_(
+                    model.parameters(), args.max_grad_norm
+                )
+
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+
+            if args.max_grad_norm > 0:
+                nn.utils.clip_grad_norm_(
+                    model.parameters(), args.max_grad_norm
+                )
+
+            optimizer.step()
+
+        if ema is not None:
+            ema.update(model)
+
+        batch_size = labels.size(0)
+        loss_sum += loss.detach().item() * batch_size
+        correct += count_correct(logits.detach(), labels)
+        samples += batch_size
+        global_step += 1
+
+    metrics = {
+        "loss": loss_sum / samples,
+        "accuracy": correct / samples,
+        "samples": samples,
+    }
+    return metrics, global_step, lr
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device, amp_enabled):
+    """Evaluate on a loader. Returns loss, accuracy and sample count."""
+    model.eval()
+
+    loss_sum = 0.0
+    correct = 0
+    samples = 0
+
+    for images, labels in loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=amp_enabled,
+        ):
+            logits = model(images)
+            loss = criterion(logits, labels)
+
+        batch_size = labels.size(0)
+        loss_sum += loss.item() * batch_size
+        correct += count_correct(logits, labels)
+        samples += batch_size
+
+    if samples == 0:
+        raise RuntimeError("The DataLoader produced no samples.")
+
+    return {
+        "loss": loss_sum / samples,
+        "accuracy": correct / samples,
+        "samples": samples,
+    }
+
+
+# ---------------------------------------------------------------------
+# Checkpoint, history and plotting
+# ---------------------------------------------------------------------
+
+def config_dict(args):
+    """Arguments as a plain dictionary that JSON and torch.save accept."""
+    return {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+
 
 def save_checkpoint(
     path,
     model,
-    optimizer,
     epoch,
     best_val_accuracy,
     best_val_loss,
+    model_config,
     args,
+    optimizer=None,
 ):
-    """Save model weights and enough information to reproduce the run."""
+    """
+    Save weights plus the information needed to rebuild the model.
+
+    `model` is the module that was validated, so with EMA enabled the stored
+    weights are the averaged ones.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "best_val_accuracy": best_val_accuracy,
-            "best_val_loss": best_val_loss,
-            "model_name": "ConvNeXt",
-            "model_config": {
-                "in_channels": 1,
-                "num_classes": 2,
-                "depths": (3, 3, 9, 3),
-                "dims": (96, 192, 384, 768),
-                "drop_path_rate": args.drop_path,
-                "layer_scale_init": 1e-6,
-                "dropout": args.dropout,
-            },
-            "training_config": vars(args),
-        },
-        path,
-    )
+    payload = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "best_val_accuracy": best_val_accuracy,
+        "best_val_loss": best_val_loss,
+        "model_name": "ConvNeXt",
+        "model_config": model_config,
+        "training_config": config_dict(args),
+    }
 
+    if optimizer is not None:
+        payload["optimizer_state_dict"] = optimizer.state_dict()
+
+    torch.save(payload, path)
 
 
 def write_history(path, history, args):
     """Save the experiment configuration and epoch metrics as JSON."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    config = {
-        key: str(value) if isinstance(value, Path) else value
-        for key, value in vars(args).items()
-    }
-
     with path.open("w", encoding="utf-8") as file:
         json.dump(
-            {
-                "config": config,
-                "history": history,
-            },
+            {"config": config_dict(args), "history": history},
             file,
             indent=2,
         )
 
 
+def save_curves(history, path):
+    """Plot train and validation loss and accuracy to one PNG."""
+    epochs = [entry["epoch"] for entry in history]
 
-# ---------------------------------------------------------------------
-# Optional final test evaluation
-# ---------------------------------------------------------------------
-
-def evaluate_test_set(model, loader, criterion, device, amp_enabled):
-    """Evaluate the held-out test set, intended for final evaluation only."""
-    metrics = run_epoch(
-        model=model,
-        loader=loader,
-        criterion=criterion,
-        device=device,
-        amp_enabled=amp_enabled,
+    figure, (loss_axis, accuracy_axis) = plt.subplots(
+        1, 2, figsize=(10, 3.6)
     )
 
-    print("\nFinal held-out test results")
-    print(f"Test loss:     {metrics['loss']:.4f}")
-    print(f"Test accuracy: {metrics['accuracy']:.4f}")
-    print(f"Test samples:  {metrics['samples']}")
+    loss_axis.plot(epochs, [e["train_loss"] for e in history], label="train")
+    loss_axis.plot(epochs, [e["val_loss"] for e in history], label="validation")
+    loss_axis.set(xlabel="epoch", ylabel="cross-entropy loss", title="Loss")
+    loss_axis.legend()
 
-    return metrics
+    accuracy_axis.plot(
+        epochs, [e["train_accuracy"] for e in history], label="train"
+    )
+    accuracy_axis.plot(
+        epochs, [e["val_accuracy"] for e in history], label="validation"
+    )
+    accuracy_axis.set(
+        xlabel="epoch", ylabel="per-slice accuracy", title="Accuracy"
+    )
+    accuracy_axis.legend()
+
+    figure.tight_layout()
+    figure.savefig(path, dpi=130)
+    plt.close(figure)
 
 
 # ---------------------------------------------------------------------
-# Main
+# Arguments
 # ---------------------------------------------------------------------
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Train ConvNeXt on ADNI 2D MRI slices."
     )
 
     # Data
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--img-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--aug", choices=["mild", "strong"], default="mild")
+    parser.add_argument(
+        "--aug", choices=sorted(AUGMENTATIONS), default="strong_blur"
+    )
     parser.add_argument("--horizontal-flip", action="store_true")
     parser.add_argument("--subset", type=int, default=None)
 
+    # Model
+    parser.add_argument(
+        "--variant", choices=sorted(CONVNEXT_VARIANTS), default="mini"
+    )
+    parser.add_argument("--depths", type=int, nargs=4, default=None)
+    parser.add_argument("--dims", type=int, nargs=4, default=None)
+    parser.add_argument("--drop-path", type=float, default=0.2)
+    parser.add_argument("--dropout", type=float, default=0.3)
+
     # Optimisation
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--warmup-epochs", type=float, default=5.0)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
-    parser.add_argument("--drop-path", type=float, default=0.1)
-    parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--ema-decay", type=float, default=0.999,
+        help="EMA decay per optimiser step; 0 disables EMA.",
+    )
 
     # Runtime and output
+    parser.add_argument("--run-name", default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--deterministic", action="store_true")
     parser.add_argument(
         "--eval-test",
         action="store_true",
         help="Evaluate the held-out test set once after training finishes.",
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
@@ -308,35 +428,63 @@ def parse_args():
         parser.error("--dropout must be in [0, 1)")
     if args.max_grad_norm < 0:
         parser.error("--max-grad-norm cannot be negative")
+    if not 0 <= args.ema_decay < 1:
+        parser.error("--ema-decay must be in [0, 1)")
+    if (args.depths is None) != (args.dims is None):
+        parser.error("--depths and --dims must be given together")
 
     return args
 
 
-def main():
-    args = parse_args()
-    set_seed(args.seed)
+def resolve_architecture(args):
+    """Return (depths, dims, label) from a preset or explicit overrides."""
+    if args.depths is not None:
+        return tuple(args.depths), tuple(args.dims), "custom"
 
-    # Device selection
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    preset = CONVNEXT_VARIANTS[args.variant]
+    return preset["depths"], preset["dims"], args.variant
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
+def main(argv=None):
+    args = parse_args(argv)
+    set_seed(args.seed, deterministic=args.deterministic)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = device.type == "cuda" and not args.no_amp
 
+    depths, dims, arch_label = resolve_architecture(args)
+    run = args.run_name or arch_label
+
+    cpus = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else os.cpu_count()
+    )
+
     print("=" * 65)
-    print("ADNI MRI Classification — ConvNeXt")
+    print(f"ADNI MRI Classification - ConvNeXt ({arch_label})")
     print("=" * 65)
+    print(f"Run name:        {run}")
     print(f"Device:          {device}")
     print(f"Mixed precision: {amp_enabled}")
-    print(f"Epochs:           {args.epochs}")
-    print(f"Batch size:       {args.batch_size}")
-    print(f"Learning rate:    {args.lr}")
-    print(f"Weight decay:     {args.weight_decay}")
-    print(f"Augmentation:     {args.aug}")
-    print(f"Seed:             {args.seed}")
-    print(f"Test evaluation:  {args.eval_test}")
+    print(f"CPUs available:  {cpus} (data workers: {args.workers})")
+    print(f"Depths / dims:   {depths} / {dims}")
+    print(f"Epochs:          {args.epochs} (patience {args.patience})")
+    print(f"Batch size:      {args.batch_size}")
+    print(f"Learning rate:   {args.lr}")
+    print(f"Weight decay:    {args.weight_decay}")
+    print(f"Drop path:       {args.drop_path}   Dropout: {args.dropout}")
+    print(f"EMA decay:       {args.ema_decay}")
+    print(f"Augmentation:    {args.aug}")
+    print(f"Seed:            {args.seed}")
+    print(f"Test evaluation: {args.eval_test}")
     print("=" * 65)
 
-    # Load data. The dataset module creates subject-level splits.
+    # The dataset module creates the subject-level splits.
     loaders = get_dataloaders(
         batch_size=args.batch_size,
         img_size=args.img_size,
@@ -356,40 +504,33 @@ def main():
     print(f"Validation batches: {len(val_loader)}")
     print(f"Test batches:       {len(test_loader)}")
 
-    # Build the full ConvNeXt architecture.
-    model = ConvNeXt(
-        in_channels=1,
-        num_classes=2,
-        depths=(3, 3, 9, 3),
-        dims=(96, 192, 384, 768),
-        drop_path_rate=args.drop_path,
-        layer_scale_init=1e-6,
-        dropout=args.dropout,
-    ).to(device)
+    model_config = {
+        "in_channels": 1,
+        "num_classes": 2,
+        "depths": depths,
+        "dims": dims,
+        "drop_path_rate": args.drop_path,
+        "layer_scale_init": 1e-6,
+        "dropout": args.dropout,
+    }
 
-    parameter_count = sum(
-        parameter.numel() for parameter in model.parameters()
-    )
-    trainable_count = sum(
-        parameter.numel()
-        for parameter in model.parameters()
-        if parameter.requires_grad
-    )
+    model = ConvNeXt(**model_config).to(device)
 
+    parameter_count = sum(p.numel() for p in model.parameters())
     print(f"\nModel parameters: {parameter_count:,}")
-    print(f"Trainable parameters: {trainable_count:,}")
 
-    criterion = nn.CrossEntropyLoss(
+    ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
+
+    # Weights that get validated, checkpointed and finally tested.
+    eval_model = ema.module if ema is not None else model
+
+    train_criterion = nn.CrossEntropyLoss(
         label_smoothing=args.label_smoothing
     )
+    eval_criterion = nn.CrossEntropyLoss()
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    optimizer = build_optimizer(model, args.lr, args.weight_decay)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     total_steps = args.epochs * len(train_loader)
     warmup_steps = min(
@@ -399,9 +540,10 @@ def main():
 
     output_dir = args.output_dir
     checkpoint_dir = output_dir / "checkpoints"
-    checkpoint_path = checkpoint_dir / "convnext_best.pt"
-    history_path = output_dir / "convnext_history.json"
-    last_checkpoint_path = checkpoint_dir / "convnext_last.pt"
+    best_path = checkpoint_dir / f"{run}_best.pt"
+    last_path = checkpoint_dir / f"{run}_last.pt"
+    history_path = output_dir / f"{run}_history.json"
+    curves_path = output_dir / f"{run}_curves.png"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -415,88 +557,32 @@ def main():
 
     start_time = time.time()
 
-    # -------------------------------------------------------------
-    # Training loop
-    # -------------------------------------------------------------
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
 
-        # Training
-        model.train()
-        train_loss_sum = 0.0
-        train_correct = 0
-        train_samples = 0
-
-        for images, labels in train_loader:
-            lr = learning_rate_at_step(
-                step=global_step,
-                total_steps=total_steps,
-                warmup_steps=warmup_steps,
-                base_lr=args.lr,
-                min_lr=args.min_lr,
-            )
-
-            for group in optimizer.param_groups:
-                group["lr"] = lr
-
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with torch.autocast(
-                device_type=device.type,
-                dtype=torch.float16,
-                enabled=amp_enabled,
-            ):
-                logits = model(images)
-                loss = criterion(logits, labels)
-
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-
-                if args.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), args.max_grad_norm
-                    )
-
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-
-                if args.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), args.max_grad_norm
-                    )
-
-                optimizer.step()
-
-            batch_size = labels.size(0)
-            train_loss_sum += loss.detach().item() * batch_size
-            train_correct += calculate_accuracy(logits.detach(), labels)
-            train_samples += batch_size
-            global_step += 1
-
-        train_metrics = {
-            "loss": train_loss_sum / train_samples,
-            "accuracy": train_correct / train_samples,
-            "samples": train_samples,
-        }
-
-        # Validation: never update model weights using validation batches.
-        val_metrics = run_epoch(
+        train_metrics, global_step, lr = train_one_epoch(
             model=model,
-            loader=val_loader,
-            criterion=criterion,
+            loader=train_loader,
+            criterion=train_criterion,
+            optimizer=optimizer,
+            scaler=scaler,
             device=device,
             amp_enabled=amp_enabled,
+            args=args,
+            total_steps=total_steps,
+            warmup_steps=warmup_steps,
+            global_step=global_step,
+            ema=ema,
+        )
+
+        # Validation never updates weights.
+        val_metrics = evaluate(
+            eval_model, val_loader, eval_criterion, device, amp_enabled
         )
 
         epoch_seconds = time.time() - epoch_start
 
-        epoch_result = {
+        history.append({
             "epoch": epoch,
             "lr": lr,
             "train_loss": train_metrics["loss"],
@@ -504,31 +590,18 @@ def main():
             "val_loss": val_metrics["loss"],
             "val_accuracy": val_metrics["accuracy"],
             "epoch_seconds": epoch_seconds,
-        }
-        history.append(epoch_result)
+        })
 
         print(
-            f"Epoch {epoch:03d}/{args.epochs:03d} | "
-            f"LR {lr:.2e} | "
-            f"Train loss {train_metrics['loss']:.4f} | "
-            f"Train acc {train_metrics['accuracy']:.4f} | "
-            f"Val loss {val_metrics['loss']:.4f} | "
-            f"Val acc {val_metrics['accuracy']:.4f} | "
-            f"{epoch_seconds:.1f}s"
+            f"Epoch {epoch:03d}/{args.epochs:03d} | LR {lr:.2e} | "
+            f"Train loss {train_metrics['loss']:.4f} "
+            f"acc {train_metrics['accuracy']:.4f} | "
+            f"Val loss {val_metrics['loss']:.4f} "
+            f"acc {val_metrics['accuracy']:.4f} | "
+            f"{epoch_seconds:.1f}s",
+            flush=True,
         )
 
-        # Save the most recent state in case the job is interrupted.
-        save_checkpoint(
-            path=last_checkpoint_path,
-            model=model,
-            optimizer=optimizer,
-            epoch=epoch,
-            best_val_accuracy=best_val_accuracy,
-            best_val_loss=best_val_loss,
-            args=args,
-        )
-
-        # Select the best checkpoint using validation data only.
         improved = (
             val_metrics["accuracy"] > best_val_accuracy
             or (
@@ -544,67 +617,58 @@ def main():
             epochs_without_improvement = 0
 
             save_checkpoint(
-                path=checkpoint_path,
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                best_val_accuracy=best_val_accuracy,
-                best_val_loss=best_val_loss,
-                args=args,
+                best_path, eval_model, epoch,
+                best_val_accuracy, best_val_loss, model_config, args,
             )
-
-            print(
-                f"  Saved best checkpoint "
-                f"(validation accuracy: {best_val_accuracy:.4f})"
-            )
+            print(f"  Saved best checkpoint "
+                  f"(validation accuracy {best_val_accuracy:.4f})")
         else:
             epochs_without_improvement += 1
 
+        # Latest state, kept so an interrupted job can be inspected.
+        save_checkpoint(
+            last_path, eval_model, epoch,
+            best_val_accuracy, best_val_loss, model_config, args,
+            optimizer=optimizer,
+        )
+
         write_history(history_path, history, args)
+        save_curves(history, curves_path)
 
         if epochs_without_improvement >= args.patience:
             print(
-                f"\nEarly stopping: validation performance did not "
-                f"improve for {args.patience} consecutive epochs."
+                f"\nEarly stopping: no improvement for "
+                f"{args.patience} consecutive epochs."
             )
             break
 
-    # -------------------------------------------------------------
-    # Restore the best validation checkpoint
-    # -------------------------------------------------------------
-    if not checkpoint_path.is_file():
+    # Restore the best validation weights into the evaluated module.
+    if not best_path.is_file():
         raise RuntimeError("No best-model checkpoint was saved.")
 
-    # weights_only=False is required for the full checkpoint dictionary
-    # on PyTorch versions where weights-only loading is the default.
     try:
         checkpoint = torch.load(
-            checkpoint_path,
-            map_location=device,
-            weights_only=False,
+            best_path, map_location=device, weights_only=False
         )
     except TypeError:
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location=device,
-        )
+        checkpoint = torch.load(best_path, map_location=device)
 
-    model.load_state_dict(checkpoint["model_state_dict"])
+    eval_model.load_state_dict(checkpoint["model_state_dict"])
 
     elapsed_minutes = (time.time() - start_time) / 60.0
 
     print("\n" + "=" * 65)
     print("Training finished")
     print("=" * 65)
-    print(f"Best epoch:             {best_epoch}")
-    print(f"Best validation acc:    {best_val_accuracy:.4f}")
-    print(f"Best validation loss:   {best_val_loss:.4f}")
-    print(f"Elapsed time:           {elapsed_minutes:.1f} minutes")
-    print(f"Best checkpoint:        {checkpoint_path}")
-    print(f"Last checkpoint:        {last_checkpoint_path}")
-    print(f"Training history:       {history_path}")
+    print(f"Best epoch:           {best_epoch}")
+    print(f"Best validation acc:  {best_val_accuracy:.4f}")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Elapsed time:         {elapsed_minutes:.1f} minutes")
+    print(f"Best checkpoint:      {best_path}")
+    print(f"History:              {history_path}")
+    print(f"Curves:               {curves_path}")
 
-    # The test set remains untouched unless explicitly requested.
+    # The test set stays untouched unless explicitly requested.
     if args.eval_test:
         if args.subset is not None:
             raise ValueError(
@@ -612,15 +676,17 @@ def main():
                 "Rerun without --subset for a proper final evaluation."
             )
 
-        test_metrics = evaluate_test_set(
-            model=model,
-            loader=test_loader,
-            criterion=criterion,
-            device=device,
-            amp_enabled=amp_enabled,
+        test_metrics = evaluate(
+            eval_model, test_loader, eval_criterion, device, amp_enabled
         )
+        test_metrics["best_epoch"] = best_epoch
 
-        test_path = output_dir / "convnext_test_results.json"
+        print("\nFinal held-out test results (best validation checkpoint)")
+        print(f"Test loss:     {test_metrics['loss']:.4f}")
+        print(f"Test accuracy: {test_metrics['accuracy']:.4f}")
+        print(f"Test samples:  {test_metrics['samples']}")
+
+        test_path = output_dir / f"{run}_test_results.json"
         with test_path.open("w", encoding="utf-8") as file:
             json.dump(test_metrics, file, indent=2)
 

@@ -1,4 +1,3 @@
-
 """
 Neural network architectures for ADNI 2D MRI classification.
 
@@ -396,3 +395,40 @@ class ConvNeXt(nn.Module):
     def forward(self, x):
         x = self.forward_features(x)
         return self.head(x)
+
+
+# ---------------------------------------------------------------------
+# Size presets and checkpoint helpers
+# ---------------------------------------------------------------------
+
+CONVNEXT_VARIANTS = {
+    "tiny": {"depths": (3, 3, 9, 3), "dims": (96, 192, 384, 768)},
+    "mini": {"depths": (2, 2, 6, 2), "dims": (64, 128, 256, 512)},
+    "micro": {"depths": (2, 2, 4, 2), "dims": (48, 96, 192, 384)},
+}
+
+
+def build_convnext(variant="mini", **overrides):
+    """Build a ConvNeXt from a named size preset plus keyword overrides."""
+    if variant not in CONVNEXT_VARIANTS:
+        raise ValueError(
+            f"Unknown variant {variant!r}; "
+            f"choose from {list(CONVNEXT_VARIANTS)}"
+        )
+
+    config = dict(CONVNEXT_VARIANTS[variant])
+    config.update(overrides)
+    return ConvNeXt(**config)
+
+
+def convnext_from_checkpoint(checkpoint):
+    """
+    Rebuild a ConvNeXt from a checkpoint written by train.py.
+
+    The caller loads the weights:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    """
+    config = dict(checkpoint["model_config"])
+    config["depths"] = tuple(config["depths"])
+    config["dims"] = tuple(config["dims"])
+    return ConvNeXt(**config)
