@@ -273,7 +273,7 @@ class ADNISliceDataset(Dataset):
 
 
 def get_dataloaders(batch_size=64, img_size=PAD_SIZE, seed=SEED, num_workers=4,
-                    hflip=False, root=ADNI_ROOT, subset=None):
+                    hflip=False, root=ADNI_ROOT, subset=None, aug="mild"):
     """
     Build train/val/test DataLoaders from the subject-level split.
 
@@ -290,7 +290,7 @@ def get_dataloaders(batch_size=64, img_size=PAD_SIZE, seed=SEED, num_workers=4,
     for name, records in splits.items():
         train = name == "train"
         dataset = ADNISliceDataset(
-            records, build_transforms(train, mean, std, img_size, hflip))
+            records, build_transforms(train, mean, std, img_size, hflip, aug))
         generator = torch.Generator().manual_seed(seed) if train else None
         loaders[name] = DataLoader(
             dataset, batch_size=batch_size, shuffle=train,

@@ -132,3 +132,9 @@ All runs use the subject-level split (seed 42), the same augmentation and the sc
 | `convnext_c` | 646846 | ConvNeXt | as A with `--weight-decay 0.1 --drop-path 0.2 --label-smoothing 0.1` |
 
 The first CNN run (`cnn`) used a constant learning rate and serves as a pipeline check. It trains at about 90 s per epoch, limited by data loading. Its validation accuracy swings between about 0.50 and 0.73 while training accuracy reaches about 0.87, so the cosine-schedule runs form the matched comparison. ConvNeXt B and C each change one thing relative to A (learning rate, regularisation), and the final configuration is chosen on validation accuracy and validation loss only. Parameter counts: CNN about 94k, ResNet 700,146, ConvNeXt 1,899,874.
+
+Second training round, submitted 11 Oct 10:05 (one running job per user, so serial):
+convnext_d 649826 (strong augmentation), convnext_e 649827 (D plus mixup 0.4 and EMA 0.999),
+convnext_f 649828 (E with a smaller ConvNeXt, depths 1/1/3/1, dims 24/48/96/192),
+resnet_d 649829 and cnn_d 649830 (baselines with the same strong augmentation).
+All use the cosine schedule, 30 epochs, seed 42; ConvNeXt runs use lr 5e-4.
