@@ -47,12 +47,19 @@ def export_predictions(ckpt_path, loaders, out_path, device=None,
     Everything downstream (benchmark, calibration, reject option, failure
     analysis) reads these files, so no analysis needs a GPU or a retrain.
     """
-    from train import build_model
-
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ckpt = torch.load(ckpt_path, map_location=device)
-    model = build_model(ckpt["model"], argparse.Namespace(**ckpt["args"])).to(device)
-    model.load_state_dict(ckpt["state_dict"])
+    if "model_state_dict" in ckpt:
+        # new-format ConvNeXt checkpoints (train.py with model_config)
+        from modules import convnext_from_checkpoint
+        model = convnext_from_checkpoint(ckpt).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+    else:
+        # old-format checkpoints (baselines)
+        from train import build_model
+        model = build_model(ckpt["model"],
+                            argparse.Namespace(**ckpt["args"])).to(device)
+        model.load_state_dict(ckpt["state_dict"])
 
     out = {"epoch": np.asarray(ckpt["epoch"])}
     for split in splits:
