@@ -61,6 +61,13 @@ BLUR = {
     "strong_blur": (5, (0.3, 1.2), 0.5),
 }
 
+# A separate resize-and-crop pipeline. Images are loaded at their native
+# 240 x 256 size and stretched (not padded) to a square, then cropped at
+# random for training. It is selected with aug="stretch_crop" and uses its
+# own normalisation statistics, computed from the training split only.
+STRETCH_CROP = "stretch_crop"
+AUG_CHOICES = sorted(AUGMENTATIONS) + [STRETCH_CROP]
+
 
 # ---------------------------------------------------------------------
 # Metadata and sample collection
@@ -345,14 +352,36 @@ def load_padded_image(path):
     )
 
 
-def compute_norm_stats(train_records, seed=SEED, stats_path=STATS_PATH):
+def load_raw_image(path):
+    """Load an MRI slice at its native size as a float tensor in [0, 1]."""
+    with Image.open(path) as image:
+        return TF.to_tensor(image.convert("L"))
+
+
+def compute_norm_stats(
+    train_records,
+    seed=SEED,
+    stats_path=STATS_PATH,
+    *,
+    mode="pad",
+    img_size=IMAGE_SIZE,
+):
     """
     Compute grayscale mean and standard deviation using training images only.
+
+    mode="pad" measures the zero-padded 256 x 256 images (the default).
+    mode="stretch" measures native images resized to img_size x img_size and
+    caches to its own file, so the padded statistics are never overwritten.
 
     Cached statistics are reused only if the seed and training-record
     fingerprint match. Validation and test images never enter this calculation.
     """
     stats_path = Path(stats_path)
+
+    if mode == "stretch" and stats_path == STATS_PATH:
+        stats_path = STATS_PATH.with_name(
+            f"norm_stats_stretch{img_size}.json"
+        )
 
     fingerprint_source = "\n".join(
         f"{record['path']}|{record['label']}"
@@ -361,6 +390,10 @@ def compute_norm_stats(train_records, seed=SEED, stats_path=STATS_PATH):
             key=lambda item: item["path"],
         )
     )
+
+    # The padded fingerprint is left unchanged so its existing cache stays valid.
+    if mode == "stretch":
+        fingerprint_source = f"stretch|{img_size}\n" + fingerprint_source
     fingerprint = hashlib.sha256(
         fingerprint_source.encode("utf-8")
     ).hexdigest()
@@ -394,7 +427,14 @@ def compute_norm_stats(train_records, seed=SEED, stats_path=STATS_PATH):
     pixel_count = 0
 
     for record in train_records:
-        image = load_padded_image(record["path"]).double()
+        if mode == "stretch":
+            image = TF.resize(
+                load_raw_image(record["path"]),
+                [img_size, img_size],
+                antialias=True,
+            ).double()
+        else:
+            image = load_padded_image(record["path"]).double()
 
         total += image.sum().item()
         total_squared += image.square().sum().item()
@@ -518,6 +558,47 @@ def build_transforms(
     return transforms.Compose(steps)
 
 
+def build_stretch_transforms(training, mean, std, img_size=224):
+    """
+    Resize-and-crop pipeline for native 240 x 256 tensors.
+
+    Training: stretch to a slightly larger square, random-resized crop to
+    img_size, horizontal flip, affine jitter, brightness/contrast jitter and a
+    light blur. Evaluation: a single resize to img_size x img_size.
+    """
+    if img_size < 32:
+        raise ValueError("img_size must be at least 32")
+
+    if training:
+        pre_size = round(img_size * 256 / 224)
+
+        steps = [
+            transforms.Resize((pre_size, pre_size), antialias=True),
+            transforms.RandomResizedCrop(
+                img_size,
+                scale=(0.9, 1.0),
+                ratio=(0.9, 1.1),
+                antialias=True,
+            ),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomAffine(
+                degrees=15,
+                translate=(0.1, 0.1),
+                scale=(0.9, 1.0),
+            ),
+            transforms.ColorJitter(brightness=0.1, contrast=0.15),
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+        ]
+    else:
+        steps = [
+            transforms.Resize((img_size, img_size), antialias=True),
+        ]
+
+    steps.append(transforms.Normalize([mean], [std]))
+
+    return transforms.Compose(steps)
+
+
 def _ensure_padded_size(image):
     """Pad a tensor image to the configured square canvas."""
     _, height, width = image.shape
@@ -546,16 +627,17 @@ def _ensure_padded_size(image):
 class ADNISliceDataset(Dataset):
     """Dataset returning (image tensor, integer diagnosis label)."""
 
-    def __init__(self, records, transform):
+    def __init__(self, records, transform, loader=load_padded_image):
         self.records = records
         self.transform = transform
+        self.loader = loader
 
     def __len__(self):
         return len(self.records)
 
     def __getitem__(self, index):
         record = self.records[index]
-        image = load_padded_image(record["path"])
+        image = self.loader(record["path"])
         image = self.transform(image)
 
         label = torch.tensor(record["label"], dtype=torch.long)
@@ -604,7 +686,14 @@ def get_dataloaders(
 
     # Calculate statistics from the full training split before optional
     # smoke-test subsampling, so the cache describes the actual split.
-    mean, std = compute_norm_stats(splits["train"], seed=seed)
+    stretch = aug == STRETCH_CROP
+
+    mean, std = compute_norm_stats(
+        splits["train"],
+        seed=seed,
+        mode="stretch" if stretch else "pad",
+        img_size=img_size,
+    )
 
     if subset is not None:
         if subset < 1:
@@ -629,16 +718,26 @@ def get_dataloaders(
     for split_name, records in splits.items():
         training = split_name == "train"
 
-        dataset = ADNISliceDataset(
-            records=records,
-            transform=build_transforms(
+        if stretch:
+            transform = build_stretch_transforms(
+                training, mean, std, img_size
+            )
+            image_loader = load_raw_image
+        else:
+            transform = build_transforms(
                 training=training,
                 mean=mean,
                 std=std,
                 img_size=img_size,
                 aug=aug,
                 horizontal_flip=horizontal_flip,
-            ),
+            )
+            image_loader = load_padded_image
+
+        dataset = ADNISliceDataset(
+            records=records,
+            transform=transform,
+            loader=image_loader,
         )
 
         generator = torch.Generator()

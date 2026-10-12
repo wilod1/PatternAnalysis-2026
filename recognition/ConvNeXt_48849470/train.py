@@ -31,8 +31,34 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from dataset import AUGMENTATIONS, get_dataloaders
+from dataset import AUG_CHOICES, get_dataloaders
 from modules import CONVNEXT_VARIANTS, ConvNeXt
+
+# Named bundles of defaults. Any flag given on the command line still wins.
+RECIPES = {
+    "default": {},
+    # Resize-and-crop pipeline with a plain AdamW schedule: no EMA, no
+    # gradient clipping, no dropout, weight decay on every parameter, no
+    # early stopping, and the learning rate stepped once per epoch.
+    "resizecrop": {
+        "aug": "stretch_crop",
+        "img_size": 224,
+        "batch_size": 64,
+        "epochs": 200,
+        "patience": 1_000_000,
+        "lr": 1e-3,
+        "min_lr": 1e-6,
+        "weight_decay": 1e-4,
+        "warmup_epochs": 5.0,
+        "label_smoothing": 0.05,
+        "drop_path": 0.1,
+        "dropout": 0.0,
+        "max_grad_norm": 0.0,
+        "ema_decay": 0.0,
+        "decay_all": True,
+        "lr_unit": "epoch",
+    },
+}
 
 
 # ---------------------------------------------------------------------
@@ -92,8 +118,18 @@ class ModelEMA:
 # Optimiser and learning-rate schedule
 # ---------------------------------------------------------------------
 
-def build_optimizer(model, lr, weight_decay):
-    """AdamW with weight decay on weight matrices and kernels only."""
+def build_optimizer(model, lr, weight_decay, decay_all=False):
+    """
+    AdamW. By default weight decay skips norm scales, biases and
+    layer-scale vectors; decay_all applies it to every parameter.
+    """
+    if decay_all:
+        return torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+
     decay, no_decay = [], []
 
     for parameter in model.parameters():
@@ -153,8 +189,14 @@ def train_one_epoch(
     warmup_steps,
     global_step,
     ema=None,
+    fixed_lr=None,
 ):
-    """One pass over the training loader. Returns (metrics, step, last lr)."""
+    """
+    One pass over the training loader. Returns (metrics, step, last lr).
+
+    With fixed_lr set, that learning rate is used for the whole epoch;
+    otherwise the schedule is evaluated at every optimiser step.
+    """
     model.train()
 
     loss_sum = 0.0
@@ -163,13 +205,16 @@ def train_one_epoch(
     lr = args.lr
 
     for images, labels in loader:
-        lr = learning_rate_at_step(
-            step=global_step,
-            total_steps=total_steps,
-            warmup_steps=warmup_steps,
-            base_lr=args.lr,
-            min_lr=args.min_lr,
-        )
+        if fixed_lr is not None:
+            lr = fixed_lr
+        else:
+            lr = learning_rate_at_step(
+                step=global_step,
+                total_steps=total_steps,
+                warmup_steps=warmup_steps,
+                base_lr=args.lr,
+                min_lr=args.min_lr,
+            )
 
         for group in optimizer.param_groups:
             group["lr"] = lr
@@ -353,8 +398,19 @@ def save_curves(history, path):
 # ---------------------------------------------------------------------
 
 def parse_args(argv=None):
+    # First pass: find the recipe so its values can become the defaults.
+    recipe_parser = argparse.ArgumentParser(add_help=False)
+    recipe_parser.add_argument(
+        "--recipe", choices=sorted(RECIPES), default="default"
+    )
+    known, _ = recipe_parser.parse_known_args(argv)
+
     parser = argparse.ArgumentParser(
         description="Train ConvNeXt on ADNI 2D MRI slices."
+    )
+    parser.add_argument(
+        "--recipe", choices=sorted(RECIPES), default="default",
+        help="Named bundle of defaults; explicit flags override it.",
     )
 
     # Data
@@ -362,9 +418,7 @@ def parse_args(argv=None):
     parser.add_argument("--img-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument(
-        "--aug", choices=sorted(AUGMENTATIONS), default="strong_blur"
-    )
+    parser.add_argument("--aug", choices=AUG_CHOICES, default="strong_blur")
     parser.add_argument("--horizontal-flip", action="store_true")
     parser.add_argument("--subset", type=int, default=None)
 
@@ -390,6 +444,14 @@ def parse_args(argv=None):
         "--ema-decay", type=float, default=0.999,
         help="EMA decay per optimiser step; 0 disables EMA.",
     )
+    parser.add_argument(
+        "--decay-all", action=argparse.BooleanOptionalAction, default=False,
+        help="Apply weight decay to every parameter, including norms.",
+    )
+    parser.add_argument(
+        "--lr-unit", choices=["step", "epoch"], default="step",
+        help="Evaluate the learning-rate schedule per step or per epoch.",
+    )
 
     # Runtime and output
     parser.add_argument("--run-name", default=None)
@@ -402,6 +464,7 @@ def parse_args(argv=None):
         help="Evaluate the held-out test set once after training finishes.",
     )
 
+    parser.set_defaults(**RECIPES[known.recipe])
     args = parser.parse_args(argv)
 
     if args.batch_size < 1:
@@ -468,7 +531,7 @@ def main(argv=None):
     print("=" * 65)
     print(f"ADNI MRI Classification - ConvNeXt ({arch_label})")
     print("=" * 65)
-    print(f"Run name:        {run}")
+    print(f"Run name:        {run}   (recipe: {args.recipe})")
     print(f"Device:          {device}")
     print(f"Mixed precision: {amp_enabled}")
     print(f"CPUs available:  {cpus} (data workers: {args.workers})")
@@ -479,7 +542,9 @@ def main(argv=None):
     print(f"Weight decay:    {args.weight_decay}")
     print(f"Drop path:       {args.drop_path}   Dropout: {args.dropout}")
     print(f"EMA decay:       {args.ema_decay}")
-    print(f"Augmentation:    {args.aug}")
+    print(f"Augmentation:    {args.aug}   Image size: {args.img_size}")
+    print(f"LR unit: {args.lr_unit}   Decay all: {args.decay_all}   "
+          f"Grad clip: {args.max_grad_norm}")
     print(f"Seed:            {args.seed}")
     print(f"Test evaluation: {args.eval_test}")
     print("=" * 65)
@@ -529,7 +594,9 @@ def main(argv=None):
     )
     eval_criterion = nn.CrossEntropyLoss()
 
-    optimizer = build_optimizer(model, args.lr, args.weight_decay)
+    optimizer = build_optimizer(
+        model, args.lr, args.weight_decay, decay_all=args.decay_all
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     total_steps = args.epochs * len(train_loader)
@@ -560,6 +627,17 @@ def main(argv=None):
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
 
+        epoch_lr = None
+
+        if args.lr_unit == "epoch":
+            epoch_lr = learning_rate_at_step(
+                step=epoch - 1,
+                total_steps=args.epochs,
+                warmup_steps=int(args.warmup_epochs),
+                base_lr=args.lr,
+                min_lr=args.min_lr,
+            )
+
         train_metrics, global_step, lr = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -573,6 +651,7 @@ def main(argv=None):
             warmup_steps=warmup_steps,
             global_step=global_step,
             ema=ema,
+            fixed_lr=epoch_lr,
         )
 
         # Validation never updates weights.
