@@ -29,6 +29,7 @@ matplotlib.use("Agg")  # no display on the cluster
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from torch.utils.data import RandomSampler
 import torch.nn as nn
 
 from dataset import AUG_CHOICES, get_dataloaders
@@ -270,14 +271,77 @@ def train_one_epoch(
     return metrics, global_step, lr
 
 
+SELECT_METRICS = {
+    "slice_acc": "accuracy",
+    "patient_acc": "patient_accuracy",
+    "patient_bal_acc": "patient_balanced_accuracy",
+    "patient_auc": "patient_auc",
+}
+
+
+def rank_auc(scores, labels):
+    """Area under the ROC curve; ties count half. Returns 0.5 if one class."""
+    positives = scores[labels == 1]
+    negatives = scores[labels == 0]
+    if len(positives) == 0 or len(negatives) == 0:
+        return 0.5
+    greater = (positives[:, None] > negatives[None, :]).mean()
+    ties = (positives[:, None] == negatives[None, :]).mean()
+    return float(greater + 0.5 * ties)
+
+
+def patient_metrics(probs, labels, subject_ids):
+    """
+    Patient-level metrics from slice probabilities.
+
+    A patient's score is the mean slice probability over all of their slices
+    (every scan); the patient is called AD when the mean P(AD) exceeds 0.5,
+    which is the same as argmax of the averaged probabilities.
+    """
+    _, inverse = np.unique(subject_ids, return_inverse=True)
+    n_patients = inverse.max() + 1
+
+    counts = np.bincount(inverse, minlength=n_patients).astype(float)
+    mean_p_ad = np.bincount(
+        inverse, weights=probs[:, 1], minlength=n_patients
+    ) / counts
+    patient_labels = np.zeros(n_patients, dtype=int)
+    patient_labels[inverse] = labels
+
+    predictions = (mean_p_ad > 0.5).astype(int)
+    correct = predictions == patient_labels
+    nc = patient_labels == 0
+    ad = patient_labels == 1
+
+    return {
+        "patient_accuracy": float(correct.mean()),
+        "patient_balanced_accuracy": float(
+            0.5 * (correct[nc].mean() + correct[ad].mean())
+        ),
+        "patient_auc": rank_auc(mean_p_ad, patient_labels),
+        "patients": int(n_patients),
+    }
+
+
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, amp_enabled):
-    """Evaluate on a loader. Returns loss, accuracy and sample count."""
+def evaluate(model, loader, criterion, device, amp_enabled,
+             with_patient=False):
+    """
+    Evaluate on a loader. Returns loss, accuracy and sample count.
+
+    With with_patient=True the loader must be unshuffled so rows line up with
+    loader.dataset.records, and patient-level metrics are added.
+    """
     model.eval()
 
     loss_sum = 0.0
     correct = 0
     samples = 0
+    all_probs = []
+    all_labels = []
+
+    if with_patient and isinstance(loader.sampler, RandomSampler):
+        raise ValueError("Patient-level evaluation needs an unshuffled loader")
 
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
@@ -296,14 +360,30 @@ def evaluate(model, loader, criterion, device, amp_enabled):
         correct += count_correct(logits, labels)
         samples += batch_size
 
+        if with_patient:
+            all_probs.append(torch.softmax(logits.float(), dim=1).cpu())
+            all_labels.append(labels.cpu())
+
     if samples == 0:
         raise RuntimeError("The DataLoader produced no samples.")
 
-    return {
+    metrics = {
         "loss": loss_sum / samples,
         "accuracy": correct / samples,
         "samples": samples,
     }
+
+    if with_patient:
+        records = loader.dataset.records
+        if len(records) != samples:
+            raise RuntimeError("Record count does not match sample count")
+        metrics.update(patient_metrics(
+            torch.cat(all_probs).numpy(),
+            torch.cat(all_labels).numpy(),
+            np.asarray([record["subject_id"] for record in records]),
+        ))
+
+    return metrics
 
 
 # ---------------------------------------------------------------------
@@ -383,8 +463,13 @@ def save_curves(history, path):
     accuracy_axis.plot(
         epochs, [e["val_accuracy"] for e in history], label="validation"
     )
+    if all("val_patient_accuracy" in e for e in history):
+        accuracy_axis.plot(
+            epochs, [e["val_patient_accuracy"] for e in history],
+            label="validation (patient)", linestyle="--",
+        )
     accuracy_axis.set(
-        xlabel="epoch", ylabel="per-slice accuracy", title="Accuracy"
+        xlabel="epoch", ylabel="accuracy", title="Accuracy"
     )
     accuracy_axis.legend()
 
@@ -434,6 +519,12 @@ def parse_args(argv=None):
     # Optimisation
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=30)
+    parser.add_argument(
+        "--select-metric", choices=sorted(SELECT_METRICS),
+        default="slice_acc",
+        help="Validation metric that decides the best checkpoint and early "
+             "stopping. Ties are broken by lower validation loss.",
+    )
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--weight-decay", type=float, default=0.05)
@@ -538,6 +629,7 @@ def main(argv=None):
     print(f"Depths / dims:   {depths} / {dims}")
     print(f"Epochs:          {args.epochs} (patience {args.patience})")
     print(f"Batch size:      {args.batch_size}")
+    print(f"Select metric:   {args.select_metric}")
     print(f"Learning rate:   {args.lr}")
     print(f"Weight decay:    {args.weight_decay}")
     print(f"Drop path:       {args.drop_path}   Dropout: {args.dropout}")
@@ -616,6 +708,7 @@ def main(argv=None):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     history = []
+    best_score = -1.0
     best_val_accuracy = -1.0
     best_val_loss = float("inf")
     best_epoch = 0
@@ -656,8 +749,10 @@ def main(argv=None):
 
         # Validation never updates weights.
         val_metrics = evaluate(
-            eval_model, val_loader, eval_criterion, device, amp_enabled
+            eval_model, val_loader, eval_criterion, device, amp_enabled,
+            with_patient=True,
         )
+        score = val_metrics[SELECT_METRICS[args.select_metric]]
 
         epoch_seconds = time.time() - epoch_start
 
@@ -668,6 +763,10 @@ def main(argv=None):
             "train_accuracy": train_metrics["accuracy"],
             "val_loss": val_metrics["loss"],
             "val_accuracy": val_metrics["accuracy"],
+            "val_patient_accuracy": val_metrics["patient_accuracy"],
+            "val_patient_balanced_accuracy":
+                val_metrics["patient_balanced_accuracy"],
+            "val_patient_auc": val_metrics["patient_auc"],
             "epoch_seconds": epoch_seconds,
         })
 
@@ -677,19 +776,19 @@ def main(argv=None):
             f"acc {train_metrics['accuracy']:.4f} | "
             f"Val loss {val_metrics['loss']:.4f} "
             f"acc {val_metrics['accuracy']:.4f} | "
+            f"Patient acc {val_metrics['patient_accuracy']:.4f} "
+            f"auc {val_metrics['patient_auc']:.3f} | "
             f"{epoch_seconds:.1f}s",
             flush=True,
         )
 
         improved = (
-            val_metrics["accuracy"] > best_val_accuracy
-            or (
-                val_metrics["accuracy"] == best_val_accuracy
-                and val_metrics["loss"] < best_val_loss
-            )
+            score > best_score
+            or (score == best_score and val_metrics["loss"] < best_val_loss)
         )
 
         if improved:
+            best_score = score
             best_val_accuracy = val_metrics["accuracy"]
             best_val_loss = val_metrics["loss"]
             best_epoch = epoch
@@ -700,7 +799,7 @@ def main(argv=None):
                 best_val_accuracy, best_val_loss, model_config, args,
             )
             print(f"  Saved best checkpoint "
-                  f"(validation accuracy {best_val_accuracy:.4f})")
+                  f"({args.select_metric} {best_score:.4f})")
         else:
             epochs_without_improvement += 1
 
@@ -740,7 +839,8 @@ def main(argv=None):
     print("Training finished")
     print("=" * 65)
     print(f"Best epoch:           {best_epoch}")
-    print(f"Best validation acc:  {best_val_accuracy:.4f}")
+    print(f"Selection metric:     {args.select_metric} = {best_score:.4f}")
+    print(f"Best validation acc:  {best_val_accuracy:.4f} (per slice)")
     print(f"Best validation loss: {best_val_loss:.4f}")
     print(f"Elapsed time:         {elapsed_minutes:.1f} minutes")
     print(f"Best checkpoint:      {best_path}")
