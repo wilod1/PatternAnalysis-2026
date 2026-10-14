@@ -225,13 +225,30 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
+        # Mixup: blend each image with a shuffled partner from the same batch.
+        # One mixing weight per batch; the loss blends both labels. The label
+        # with the larger weight is used for the accuracy count only.
+        mix_labels = None
+        mix_lambda = 1.0
+        if getattr(args, "mixup_alpha", 0.0) > 0:
+            mix_lambda = float(np.random.beta(args.mixup_alpha, args.mixup_alpha))
+            permutation = torch.randperm(images.size(0), device=images.device)
+            images = mix_lambda * images + (1.0 - mix_lambda) * images[permutation]
+            mix_labels = labels[permutation]
+
         with torch.autocast(
             device_type=device.type,
             dtype=torch.float16,
             enabled=amp_enabled,
         ):
             logits = model(images)
-            loss = criterion(logits, labels)
+            if mix_labels is None:
+                loss = criterion(logits, labels)
+            else:
+                loss = (
+                    mix_lambda * criterion(logits, labels)
+                    + (1.0 - mix_lambda) * criterion(logits, mix_labels)
+                )
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -259,7 +276,8 @@ def train_one_epoch(
 
         batch_size = labels.size(0)
         loss_sum += loss.detach().item() * batch_size
-        correct += count_correct(logits.detach(), labels)
+        dominant = labels if mix_labels is None or mix_lambda >= 0.5 else mix_labels
+        correct += count_correct(logits.detach(), dominant)
         samples += batch_size
         global_step += 1
 
@@ -530,6 +548,10 @@ def parse_args(argv=None):
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--warmup-epochs", type=float, default=5.0)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument(
+        "--mixup-alpha", type=float, default=0.0,
+        help="Beta(alpha, alpha) mixup on training batches; 0 disables it.",
+    )
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument(
         "--ema-decay", type=float, default=0.999,
@@ -582,6 +604,8 @@ def parse_args(argv=None):
         parser.error("--dropout must be in [0, 1)")
     if args.max_grad_norm < 0:
         parser.error("--max-grad-norm cannot be negative")
+    if args.mixup_alpha < 0:
+        parser.error("--mixup-alpha cannot be negative")
     if not 0 <= args.ema_decay < 1:
         parser.error("--ema-decay must be in [0, 1)")
     if (args.depths is None) != (args.dims is None):
@@ -630,6 +654,7 @@ def main(argv=None):
     print(f"Epochs:          {args.epochs} (patience {args.patience})")
     print(f"Batch size:      {args.batch_size}")
     print(f"Select metric:   {args.select_metric}")
+    print(f"Mixup alpha:     {args.mixup_alpha}")
     print(f"Learning rate:   {args.lr}")
     print(f"Weight decay:    {args.weight_decay}")
     print(f"Drop path:       {args.drop_path}   Dropout: {args.dropout}")
