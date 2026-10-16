@@ -205,13 +205,20 @@ def collect_samples(root=ADNI_ROOT):
 # Subject-level splitting and summaries
 # ---------------------------------------------------------------------
 
-def split_subjects(samples, seed=SEED, ratios=(0.70, 0.15, 0.15)):
+def split_subjects(samples, seed=SEED, ratios=(0.70, 0.15, 0.15),
+                   group_by="subject_id"):
     """
     Split subjects into train, validation and test sets.
 
     All scans and slices belonging to a subject remain in one split.
     The split is stratified by subject diagnosis and reproducible by seed.
+
+    group_by="scan_id" groups by scan instead. That LEAKS: scans of one
+    patient can land in different splits. It exists only to reproduce a
+    scan-level split for a labelled comparison, never for reported results.
     """
+    if group_by not in ("subject_id", "scan_id"):
+        raise ValueError("group_by must be 'subject_id' or 'scan_id'")
     if len(ratios) != 3 or any(ratio <= 0 for ratio in ratios):
         raise ValueError("ratios must contain three positive values")
 
@@ -221,7 +228,7 @@ def split_subjects(samples, seed=SEED, ratios=(0.70, 0.15, 0.15)):
     subject_labels = {}
 
     for record in samples:
-        subject_id = record["subject_id"]
+        subject_id = record[group_by]
         label = record["label"]
 
         previous = subject_labels.setdefault(subject_id, label)
@@ -262,12 +269,12 @@ def split_subjects(samples, seed=SEED, ratios=(0.70, 0.15, 0.15)):
     splits = {"train": [], "val": [], "test": []}
 
     for record in samples:
-        split_name = assignment[record["subject_id"]]
+        split_name = assignment[record[group_by]]
         splits[split_name].append(record)
 
-    # Explicitly verify that no subject occurs in more than one split.
+    # Explicitly verify that no group occurs in more than one split.
     subject_sets = {
-        name: {record["subject_id"] for record in records}
+        name: {record[group_by] for record in records}
         for name, records in splits.items()
     }
 
@@ -275,6 +282,73 @@ def split_subjects(samples, seed=SEED, ratios=(0.70, 0.15, 0.15)):
     assert subject_sets["train"].isdisjoint(subject_sets["test"])
     assert subject_sets["val"].isdisjoint(subject_sets["test"])
 
+    if group_by != "subject_id":
+        train_subjects = {r["subject_id"] for r in splits["train"]}
+        for name in ("val", "test"):
+            held = {r["subject_id"] for r in splits[name]}
+            print(f"WARNING (leaky {group_by} split): {name} has "
+                  f"{len(held)} subjects, {len(held & train_subjects)} "
+                  f"also in train")
+
+    return splits
+
+
+def split_provided(samples, seed=SEED, val_fraction=0.15):
+    """
+    The course-staff protocol, kept for a labelled comparison.
+
+    Test is the supplied test folder. The supplied train folder is split into
+    train and validation by the number at the start of the file name (the scan
+    ID), stratified by class. Because the metadata shows that one patient owns
+    several scan IDs, this protocol can place a patient in more than one split;
+    the overlap by metadata subject ID is printed so the leak is measured.
+    """
+    if not 0 < val_fraction < 1:
+        raise ValueError("val_fraction must be in (0, 1)")
+
+    def folder_of(record):
+        return Path(record["path"]).parent.parent.name
+
+    pool = [r for r in samples if folder_of(r) == "train"]
+    test = [r for r in samples if folder_of(r) == "test"]
+
+    if not pool or not test:
+        raise RuntimeError("Expected both a train and a test folder")
+
+    group_labels = {}
+    for record in pool:
+        previous = group_labels.setdefault(record["scan_id"], record["label"])
+        if previous != record["label"]:
+            raise ValueError(f"Scan {record['scan_id']} has conflicting labels")
+
+    rng = random.Random(seed)
+    val_groups = set()
+
+    for label in sorted(set(group_labels.values())):
+        groups = sorted(g for g, l in group_labels.items() if l == label)
+        rng.shuffle(groups)
+        n_val = round(val_fraction * len(groups))
+        val_groups.update(groups[:n_val])
+
+    splits = {
+        "train": [r for r in pool if r["scan_id"] not in val_groups],
+        "val": [r for r in pool if r["scan_id"] in val_groups],
+        "test": test,
+    }
+
+    train_scans = {r["scan_id"] for r in splits["train"]}
+    assert train_scans.isdisjoint({r["scan_id"] for r in splits["val"]})
+    assert train_scans.isdisjoint({r["scan_id"] for r in splits["test"]})
+
+    train_subjects = {r["subject_id"] for r in splits["train"]}
+    val_subjects = {r["subject_id"] for r in splits["val"]}
+    test_subjects = {r["subject_id"] for r in splits["test"]}
+    print(
+        "NOTE (provided protocol): by metadata subject ID, "
+        f"{len(val_subjects & train_subjects)}/{len(val_subjects)} val subjects "
+        f"and {len((test_subjects) & (train_subjects | val_subjects))}/"
+        f"{len(test_subjects)} test subjects also appear in train/val"
+    )
     return splits
 
 
@@ -666,6 +740,7 @@ def get_dataloaders(
     subset=None,
     aug="mild",
     pin_memory=None,
+    split_mode="subject",
 ):
     """
     Return a dictionary containing 'train', 'val' and 'test' DataLoaders.
@@ -679,7 +754,15 @@ def get_dataloaders(
         raise ValueError("num_workers cannot be negative")
 
     samples = collect_samples(root)
-    splits = split_subjects(samples, seed=seed)
+    if split_mode == "subject":
+        splits = split_subjects(samples, seed=seed)
+        stats_path = STATS_PATH
+    elif split_mode == "provided":
+        # Comparison only: supplied train/test folders, train split by scan.
+        splits = split_provided(samples, seed=seed)
+        stats_path = STATS_PATH.with_name("norm_stats_provided.json")
+    else:
+        raise ValueError("split_mode must be 'subject' or 'provided'")
 
     print("\nDataset split summary")
     describe_splits(splits)
@@ -691,6 +774,7 @@ def get_dataloaders(
     mean, std = compute_norm_stats(
         splits["train"],
         seed=seed,
+        stats_path=stats_path,
         mode="stretch" if stretch else "pad",
         img_size=img_size,
     )

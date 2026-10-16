@@ -52,6 +52,7 @@ def main():
     loaders = get_dataloaders(
         batch_size=64, img_size=img_size, seed=cfg.get("seed", 42),
         num_workers=args.workers, aug=aug,
+        split_mode=cfg.get("split_mode", "subject"),
     )
     run = args.checkpoint.stem.replace("_best", "")
     suffix = "" if args.split == "val" else f"_{args.split}"

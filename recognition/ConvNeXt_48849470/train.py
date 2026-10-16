@@ -524,6 +524,11 @@ def parse_args(argv=None):
     parser.add_argument("--aug", choices=AUG_CHOICES, default="strong_blur")
     parser.add_argument("--horizontal-flip", action="store_true")
     parser.add_argument("--subset", type=int, default=None)
+    parser.add_argument(
+        "--split-mode", choices=["subject", "provided"], default="subject",
+        help="'provided' = supplied train/test folders, train split by "
+             "filename number (comparison only; patients can leak).",
+    )
 
     # Model
     parser.add_argument(
@@ -653,6 +658,7 @@ def main(argv=None):
     print(f"Depths / dims:   {depths} / {dims}")
     print(f"Epochs:          {args.epochs} (patience {args.patience})")
     print(f"Batch size:      {args.batch_size}")
+    print(f"Split mode:      {args.split_mode}")
     print(f"Select metric:   {args.select_metric}")
     print(f"Mixup alpha:     {args.mixup_alpha}")
     print(f"Learning rate:   {args.lr}")
@@ -675,6 +681,7 @@ def main(argv=None):
         horizontal_flip=args.horizontal_flip,
         aug=args.aug,
         subset=args.subset,
+        split_mode=args.split_mode,
     )
 
     train_loader = loaders["train"]
