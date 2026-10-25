@@ -1,6 +1,164 @@
 # ConvNeXt for Alzheimer's Disease Classification from ADNI Brain MRI
-## *Per-slice AD versus CN classification, and what the model's confidence is worth in a clinical triage setting.*
-By William O'Driscoll, 48849470
+
+## 1. Introduction and Summary
+PLACEHOLDER
+
+## 2. The Problem and the Algorithm
+The task at hand is a binary classification problem on complex medical
+images: given a singular two-dimensional slice taken from a T1-weighted
+structural brain MRI, can it be decided whether the slice comes from a
+patient that has Alzheimer's disease (AD), or from that of a cognitavely
+normal control group (NC). The signal is anatomical and diffuse; atrophy of
+the hippocampus and cortex, and enlargement of the ventricles present
+themselves as subtle changes in both shape and texture, varying against a
+background of natural differences in head shape and age between people. A
+classifier therefore must learn which structural patterns carry diagnostic
+information, and which are merely variation of the individual person. 
+Furthermore, it must do so from a limited number of patients, due to the
+highly correlated nature of each slice, many coming from the same patient.
+
+Convolutional networks suit this setting for the fact that they incorporate
+two key assumptions that the images satisfy. Firstly, nearby pixels are
+related, and the same local pattern can matter anywhere within a particular
+image. ConvNeXt, introduced by Liu et al. (2022) is a modernised form of the
+convolutional network -- it begins as a ResNet, and continually adopts the
+design decisions that resulted in the success of vision transformers, whilst
+retaining the pure convolutional nature that gives it its name. The resultant
+fransework is a network that matches transformer-style accuracy without
+attention, which keeps it simple in terms of implementation, efficient on a 
+single GPU, and well behaved on smaller-scale datasets. In this project, the
+ConvNet for the 2020s (ConvNeXt) is implemented from scratch in PyTorch and
+trained from random initialisation.
+
+The network processes a slice in a fixed sequence of steps: a patchifying
+stem and a 4 by 4 convolution with stride 4 followed by layer normalisation
+turns the 224 by 224 slice into a 56 by 56 map of 96 channels. This map then
+passes through four stages of residual blocks, with 3, 3, 9, and 3 blocks in
+the Tiny variant. Between stages, a layer normalisation and a 2 by 2
+convolution with stride 2 halve the spatial resolution, and double the
+channels, producing maps of 28 by 28 with 192 channels, 14 by 14 with 384,
+and finally 7 by 7 with 768. Each block applies a 7 by 7 depthwise
+convolution, which gathers wide spatial context cheaply by filtering each
+channel separately, then a layer normalisation, then an inverted bottleneck:
+a linear layer expanding the channels fourfold, a GELU activation, and a
+linear layer projecting back. The block output is multiplied by a learnable
+per-channel scale, initialised at 1e-6 so that each block starts close to
+the identity and training begins from a stable point, and is added back to 
+the block input through a residual connection. Stochastic depth randomly
+drops entire residual branches during training, with a probability that
+increases with depth, which serves to regularise the network. After the last
+stage, global average pooling collapses each feature map to a singular
+number per channel, and a layer normalisation, dropout and a linear layer
+turn the 768 values into two logits. A softmax converts them into 
+probabilities of NC and AD, and the probability of the predicted class is the
+confidence score analysed further in Section 9. 
+
+Two size presets were used. The Tiny variant has the depths and widths
+mentioned above, and 27,818,594 parameters. The Mini variant has stage depths
+of 2, 2, 6, and 2, and widths of 64, 128, 256, and 512, with 8,531,650
+parameters, and is used to test whether the extra capacity assists. For
+comparison, two small baselines were implemented: a four-stage plain CNN with
+97,650 parameters, and a compact ResNet with 700,146 parameters, both
+operating on the same inputs and evaluated against the same splits, so that
+the added complexity of ConvNeXt can truly be examined. 
+
+
+## 3. Feasibility review
+
+### Feasibility Review: AD vs CN Classification on ADNI with ConvNeXt
+
+COMP3710 Pattern Recognition | William O'Driscoll, 48849470
+
+#### 1. User need, scope and acceptance criteria
+
+User: A clinician reviewing screening T1-weighted brain MRIs who needs a classifier that decides confident cases automatically and routes uncertain ones to an expert. Scope. A prototype classifying 2D ADNI slices as Alzheimer's disease (AD) or cognitively normal (CN), and testing whether its confidence is trustworthy compared with simpler baselines (the open dilemma). Targets are provisional.
+
+1. Accuracy: per-slice test accuracy ≥ 0.80 on a subject-level split, with a 95% bootstrap interval resampled over subjects.
+2. Beyond the shortcut: exceed the slice-window-only baseline (66.2% on test) and, within each mixed-class window, exceed that window's majority-class rate.
+3. Calibration: ECE and reliability diagrams for the CNN, ResNet and ConvNeXt, comparing confidence on correct and wrong predictions; ConvNeXt compared with the baselines on macro-F1, AUROC and ECE.
+4. Reject option: a confidence threshold giving ≥ 0.90 accuracy on accepted slices at ≥ 50% coverage, with coverage and residual errors reported.
+5. Resources: peak GPU memory ≤ 16 GB and ≤ 6 h per training run on one A100.
+
+#### 2. Model choice and course concepts
+
+Data: ADNI AD/CN 2D slices (256×240 grayscale, 20 per scan), zero-padded to 256×256 so stage resolutions halve cleanly. Model: a reduced ConvNeXt (Liu et al., 2022; Hard difficulty) trained from scratch, as pretrained weights are not permitted. ConvNeXt-T uses four stages with 3, 3, 9 and 3 blocks and widths of 96 to 768. The reduced model keeps the same block design (4×4 patchify stem, 7×7 depthwise convolution, LayerNorm, 4× inverted bottleneck with a single GELU, layer scale and stochastic depth) but uses fewer blocks and channels to suit the dataset size and compute budget. In the paper's ablations these design steps raise ImageNet-1K top-1 accuracy from 78.8% to 82.0% (ResNet-50 regime). That evidence comes from far larger data, so transfer to small brain-MRI data is tested, not assumed. Training uses AdamW with weight decay and a cosine schedule. Augmentation is mild (small rotation, shift, scale and intensity jitter) with no flips, because left–right flips of these sagittal-looking slices would swap the front and back of the head. Baselines: window-only, CNN and ResNet on identical splits, giving a progression from no anatomy, to plain local filters, to residual local filters, to a modern design. Evaluation: per slice, as recommended for 2D models, with confidence intervals resampled over subjects. Course concepts: convolutional inductive bias, normalisation, regularisation (weight decay, stochastic depth, augmentation), probabilistic calibration and selective prediction (risk–coverage).
+
+#### 3. Preliminary feasibility evidence
+
+Data audit (1,526 scans, 680 subjects, 30,520 slices): the provided train/test folders share 216 of 331 test subjects, so all scans are pooled and re-split by subject (70/15/15, seed 42). The test set holds 102 subjects (33 AD), 219 scans and 4,380 slices. No subject has both classes. Slice window is strongly tied to class: a window-only rule fitted on the training split scores 66.2% on test (65.5% validation) against 55.7% for always predicting the training majority, so about 10 points of any result can come from slice depth alone. Accuracy is therefore also reported per window. Pipeline test: a short run (3 epochs on a 2,000-slice subset) exercised data loading, the CNN, the training loop and checkpointing end to end; accuracy at that scale is not meaningful.
+
+#### 4. Risks, budget, next experiment and fallback
+
+Risks and mitigations: (i) the subject-level split lowers accuracy relative to the leaking provided split, and 0.80 may be hard from scratch; stochastic depth, weight decay, augmentation and early stopping on validation address overfitting. (ii) The slice-window shortcut; the window-only baseline, per-window accuracy and a window check on failure cases expose it. (iii) A small effective test set (102 subjects) gives wide intervals; differences between models are claimed only where bootstrap intervals separate. (iv) GPU queue waits of about 12 h limit the number of runs; jobs are submitted early as batch scripts, tested on small subsets first, with several configurations per job where possible. Budget: one A100 through Slurm batch jobs, each capped at 6 h, with a planned total of about eight runs (CNN, ResNet, three to four ConvNeXt configurations and final seeds). Next experiment: a full CNN baseline run, then a first ConvNeXt run after a one-batch overfitting check. Fallback: if ConvNeXt misses 0.80, first reduce width and depth or strengthen regularisation; if it is still short, report the result, since the calibration, reject-option and failure analysis carry the dilemma investigation. A second architecture (GFNet) is only attempted after the core analysis is complete.
+
+
+## 4. Dependencies and Reproducibility
+All of the experiments were run on the Rangpur cluster from the University
+of Queensland, in a Miniconda environment named torch, with Python 3.11.15,
+on a single NVIDIA A100 40GB GPU (PCIe) allocated through Slurm in the
+comp3710 partition. The code depends on PyTorch 2.13.0 built for CUDA 13.0
+with cuDNN 9.20.0, torchvision 0.28.0, NumPy 2.4.6, Pillow 12.3.0, 
+Matplotlib 3.11.1 and scikit-learn 1.9.1. These versions are pinned in
+requirements.txt. PyTorch 2.6 or later is assumed: checkpoints are loaded
+with weights_only=False because they carry the training configuration
+alongside the weights, and the scripts are written for that behaviour. The
+data are read in place from the course directory /home/groups/comp3710/ADNI
+and are not copied into the repository.
+
+Every source of randomness controlled by the code is seeded. A single seed
+of 42 fixes the subject-level split, the stratified division of the provided
+training folder into training and validation sets, weight initialisation,
+data-loader shuffling, augmentation and mixup. The normalisation statistics
+are computed from the training images of the chosen split and written to a
+file on first use, so that each protocol has its own unique statistics file.
+Runs are not bitwise reproducible by default, since cuDNN autotuning, mixed-precision arithmetic, and multi-worker data loading introduce small
+nondeterministic differences. Passing the --deterministic flag disables
+autotuning and makes repeated runs on the same hardware much closer, at the
+cost of speed, but does not guarantee identical results across different GPUs
+or library versions. Every reported result comes from a single seed, so
+differences of about a point between runs should be read as within run-to-run
+noise, and this limitation is discussed further in Section 10.
+
+Each training run is a singular Slurm job that executes train.py. The 
+ConvNeXt-Tiny headline run on the provided split can be reproduced with the
+first command below. The remaining commands reproduce the other models in the
+experiment ladder, the two baselines, and the patient-disjoint development
+runs discussed further. Evaluation on the test set happens once, at the end
+of a job, when --eval-test is given, and a job reports the test accuracy of
+the checkpoint with the best validation accuracy. A 100-epoch ConvNeXt run
+takes between 2.8 and 3.3 hours on the A100 (173 minutes for the resizecrop
+Tiny model, and 197 for the Tiny model with default recipe, which uses 
+larger inputs), and the baselines also sit inside the six-hour limit of the
+job script.
+```
+# headline experiment ladder, provided split
+sbatch slurm/train.sh --recipe resizecrop --variant tiny --epochs 100 --split-mode provided --eval-test --run-name prov_rc
+sbatch slurm/train.sh --recipe resizecrop --variant tiny --epochs 100 --patience 100 --mixup-alpha 0.4 --split-mode provided --eval-test --run-name prov_mix
+sbatch slurm/train.sh --variant tiny --split-mode provided --eval-test --run-name prov_tiny_a
+sbatch slurm/train.sh --variant mini --split-mode provided --eval-test --run-name prov_mini_a
+
+# baselines, provided split
+sbatch slurm/train.sh --model cnn --recipe resizecrop --epochs 100 --split-mode provided --eval-test --run-name prov_cnn
+sbatch slurm/train.sh --model resnet --recipe resizecrop --epochs 100 --split-mode provided --eval-test --run-name prov_resnet
+
+# supplementary development runs, patient-disjoint split (the default split mode)
+sbatch slurm/train.sh --recipe resizecrop --variant tiny --epochs 100 --run-name tiny_rc
+sbatch slurm/train.sh --recipe resizecrop --variant tiny --epochs 100 --patience 100 --mixup-alpha 0.4 --select-metric patient_auc --run-name tiny_mix
+sbatch slurm/train.sh --recipe resizecrop --variant tiny --epochs 100 --patience 100 --select-metric patient_auc --run-name tiny_pauc
+sbatch slurm/train.sh --variant tiny --run-name tiny_a
+sbatch slurm/train.sh --variant mini --run-name mini_a
+```
+
+Predictions, confidence and failure analyses, and the profiling table are
+produced from the saved checkpoints without need for retraining. The script's
+per_patient.py and export_preds.py write each model's predicted probabilities
+for the validation and test slices to results/preds, and the analysis scripts
+of Section 9 read only those files, so the figures and tables in this report
+can be regenerated in a few minutes once the checkpoints exist. Slurm reads
+the above code when a job starts, so the repository should be at the latest
+commit before any job is submitted. Training logs, checkpoints, and
+normalisation statistics are generated by the scripts and not commited to the
+repository.
 
 
 
@@ -9,23 +167,6 @@ By William O'Driscoll, 48849470
 
 
 
-
-
-
-
-## Problem and algorithm
-## How it works
-## Feasibility review
-## Dependencies and reproducibility
-## Data and preprocessing
-## Results (Results Log)
-## Investigation of the open dilemma
-### Benchmark vs baselines
-### Resource profile
-### Failure autopsies
-### Recommendation
-## Artificial Intelligence Usage Disclosure
-## Working Notes
 ### ConvNeXt paper notes (Liu et al., 2022, arXiv:2201.03545)
 
 **Macro design**
