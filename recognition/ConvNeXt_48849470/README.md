@@ -1,4 +1,18 @@
-# ConvNeXt on ADNI: AD vs CN classification
+# ConvNeXt for Alzheimer's Disease Classification from ADNI Brain MRI
+## *Per-slice AD versus CN classification, and what the model's confidence is worth in a clinical triage setting.*
+By William O'Driscoll, 48849470
+
+
+
+
+
+
+
+
+
+
+
+
 ## Problem and algorithm
 ## How it works
 ## Feasibility review

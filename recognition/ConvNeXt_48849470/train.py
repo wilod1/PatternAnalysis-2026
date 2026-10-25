@@ -33,7 +33,7 @@ from torch.utils.data import RandomSampler
 import torch.nn as nn
 
 from dataset import AUG_CHOICES, get_dataloaders
-from modules import CONVNEXT_VARIANTS, ConvNeXt
+from modules import CONVNEXT_VARIANTS, ConvNeXt, SimpleCNN, SimpleResNet
 
 # Named bundles of defaults. Any flag given on the command line still wins.
 RECIPES = {
@@ -425,6 +425,7 @@ def save_checkpoint(
     model_config,
     args,
     optimizer=None,
+    model_name="ConvNeXt",
 ):
     """
     Save weights plus the information needed to rebuild the model.
@@ -439,7 +440,7 @@ def save_checkpoint(
         "model_state_dict": model.state_dict(),
         "best_val_accuracy": best_val_accuracy,
         "best_val_loss": best_val_loss,
-        "model_name": "ConvNeXt",
+        "model_name": model_name,
         "model_config": model_config,
         "training_config": config_dict(args),
     }
@@ -531,6 +532,12 @@ def parse_args(argv=None):
     )
 
     # Model
+    parser.add_argument(
+        "--model", choices=["convnext", "cnn", "resnet"], default="convnext",
+        help="Architecture. cnn and resnet are the SimpleCNN and SimpleResNet "
+             "baselines (default widths); --variant, --depths, --dims, "
+             "--drop-path and --dropout only apply to convnext.",
+    )
     parser.add_argument(
         "--variant", choices=sorted(CONVNEXT_VARIANTS), default="mini"
     )
@@ -639,7 +646,10 @@ def main(argv=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = device.type == "cuda" and not args.no_amp
 
-    depths, dims, arch_label = resolve_architecture(args)
+    if args.model == "convnext":
+        depths, dims, arch_label = resolve_architecture(args)
+    else:
+        depths, dims, arch_label = None, None, args.model
     run = args.run_name or arch_label
 
     cpus = (
@@ -649,7 +659,7 @@ def main(argv=None):
     )
 
     print("=" * 65)
-    print(f"ADNI MRI Classification - ConvNeXt ({arch_label})")
+    print(f"ADNI MRI Classification - {args.model} ({arch_label})")
     print("=" * 65)
     print(f"Run name:        {run}   (recipe: {args.recipe})")
     print(f"Device:          {device}")
@@ -693,17 +703,25 @@ def main(argv=None):
     print(f"Validation batches: {len(val_loader)}")
     print(f"Test batches:       {len(test_loader)}")
 
-    model_config = {
-        "in_channels": 1,
-        "num_classes": 2,
-        "depths": depths,
-        "dims": dims,
-        "drop_path_rate": args.drop_path,
-        "layer_scale_init": 1e-6,
-        "dropout": args.dropout,
-    }
-
-    model = ConvNeXt(**model_config).to(device)
+    if args.model == "convnext":
+        model_name = "ConvNeXt"
+        model_config = {
+            "in_channels": 1,
+            "num_classes": 2,
+            "depths": depths,
+            "dims": dims,
+            "drop_path_rate": args.drop_path,
+            "layer_scale_init": 1e-6,
+            "dropout": args.dropout,
+        }
+        model = ConvNeXt(**model_config).to(device)
+    else:
+        # Baselines keep their default widths so parameter counts match the
+        # architectures profiled elsewhere in the report.
+        model_name = {"cnn": "SimpleCNN", "resnet": "SimpleResNet"}[args.model]
+        model_config = {"in_channels": 1, "num_classes": 2}
+        baseline_class = {"cnn": SimpleCNN, "resnet": SimpleResNet}[args.model]
+        model = baseline_class(**model_config).to(device)
 
     parameter_count = sum(p.numel() for p in model.parameters())
     print(f"\nModel parameters: {parameter_count:,}")
@@ -829,6 +847,7 @@ def main(argv=None):
             save_checkpoint(
                 best_path, eval_model, epoch,
                 best_val_accuracy, best_val_loss, model_config, args,
+                model_name=model_name,
             )
             print(f"  Saved best checkpoint "
                   f"({args.select_metric} {best_score:.4f})")
@@ -839,7 +858,7 @@ def main(argv=None):
         save_checkpoint(
             last_path, eval_model, epoch,
             best_val_accuracy, best_val_loss, model_config, args,
-            optimizer=optimizer,
+            optimizer=optimizer, model_name=model_name,
         )
 
         write_history(history_path, history, args)
