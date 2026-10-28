@@ -8,6 +8,26 @@ directories may contain slices from the same subject.
 Labels:
     NC -> 0
     AD -> 1
+
+Two evaluation protocols are supported (chosen with split_mode in
+get_dataloaders):
+    "subject"   patient-disjoint development split of the pooled scans
+                (70/15/15 by patient, stratified by diagnosis, fixed seed)
+    "provided"  the supplied train and test folders, with the train folder
+                divided into train and validation by scan (kept for the
+                headline comparison of the report; it can leak patients)
+
+Main entry points
+    collect_samples     read the metadata and list every slice as a record
+    split_subjects      patient-disjoint split
+    split_provided      split of the supplied folders
+    compute_norm_stats  mean and standard deviation from training images only
+    build_transforms    padded 256 x 256 pipeline (mild / strong presets)
+    build_stretch_transforms   resize-and-crop pipeline (224 x 224)
+    get_dataloaders     build the train / val / test DataLoaders
+
+This module is imported by train.py, utils.py and the analysis scripts; it is
+not run directly.
 """
 
 import hashlib
@@ -28,24 +48,34 @@ from torchvision.transforms import functional as TF
 # Configuration
 # ---------------------------------------------------------------------
 
+# Course copy of the data on Rangpur; the images are read in place, never copied.
 ADNI_ROOT = Path("/home/groups/comp3710/ADNI")
 METADATA_FILENAME = "meta_data_with_label.json"
 
 CLASS_TO_INDEX = {"NC": 0, "AD": 1}
+# Diagnosis codes used in the metadata file: 0 is NC and 2 is AD. Any other code
+# is rejected when the samples are collected.
 JSON_LABEL_TO_CLASS = {0: "NC", 2: "AD"}
 INDEX_TO_CLASS = {value: key for key, value in CLASS_TO_INDEX.items()}
 
-SEED = 42
-IMAGE_SIZE = 256
-RAW_HEIGHT = 240
+SEED = 42  # one seed fixes the splits, the sampling and the augmentations
+IMAGE_SIZE = 256  # side of the square canvas the slices are padded to
+RAW_HEIGHT = 240  # native size of every slice in the dataset
 RAW_WIDTH = 256
 
+# Patient identifier inside the raw path stored in the metadata, for example
+# ADNI_<site>_S_<id>. The number at the start of a file name is a scan ID, not
+# a patient ID, so this pattern is what identifies the patient.
 SUBJECT_PATTERN = re.compile(r"ADNI_(\d+_S_\d+)")
 
+# Normalisation statistics are cached next to this file, in results/
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 STATS_PATH = RESULTS_DIR / "norm_stats.json"
 
-# (rotation, translation, scale, intensity_jitter, gamma, erasing_probability)
+# Augmentation presets for the padded pipeline, as
+# (rotation in degrees, translation as a fraction of the image,
+#  scale range, brightness/contrast jitter, gamma range or None,
+#  probability of random erasing)
 AUGMENTATIONS = {
     "mild": (8, 0.03, (0.95, 1.05), 0.10, None, 0.00),
     "strong": (15, 0.08, (0.85, 1.15), 0.30, (0.70, 1.50), 0.25),
@@ -78,6 +108,7 @@ def load_scan_table(root=ADNI_ROOT):
     root = Path(root).expanduser().resolve()
     metadata_path = root / METADATA_FILENAME
 
+    # fail early with a clear message if the dataset is not where it is expected
     if not metadata_path.is_file():
         raise FileNotFoundError(
             f"ADNI metadata file was not found: {metadata_path}"
@@ -89,6 +120,7 @@ def load_scan_table(root=ADNI_ROOT):
     scan_table = {}
 
     for scan_id, entry in metadata.items():
+        # the patient identifier is read from the raw path of the scan
         match = SUBJECT_PATTERN.search(entry.get("raw", ""))
 
         if match is None:
@@ -115,6 +147,8 @@ def collect_samples(root=ADNI_ROOT):
     scan_table = load_scan_table(root)
     records = []
 
+    # Both supplied folders are read; the original folder of each slice stays
+    # recoverable from its path (see split_provided).
     for supplied_split in ("train", "test"):
         for class_name, label in CLASS_TO_INDEX.items():
             folder = root / "AD_NC" / supplied_split / class_name
@@ -128,6 +162,7 @@ def collect_samples(root=ADNI_ROOT):
                 if not path.is_file() or path.suffix.lower() != ".jpeg":
                     continue
 
+                # File names are SCANID_SLICE.jpeg, so split once from the right
                 parts = path.stem.rsplit("_", 1)
                 if len(parts) != 2:
                     raise ValueError(
@@ -141,6 +176,8 @@ def collect_samples(root=ADNI_ROOT):
                         f"Scan {scan_id} is missing from the metadata JSON"
                     )
 
+                # Cross-check the folder against the metadata: a slice filed
+                # under NC must belong to a scan labelled NC in the metadata.
                 scan_info = scan_table[scan_id]
                 metadata_label = scan_info["metadata_label"]
 
@@ -178,7 +215,9 @@ def collect_samples(root=ADNI_ROOT):
             f"No JPEG slices were found under {root / 'AD_NC'}"
         )
 
-    # Determine the observed slice-index window for each scan.
+    # Determine the observed slice-index window for each scan: the lowest and
+    # highest slice index present. The window turns out to carry class
+    # information, which is why a window-only baseline is reported.
     scan_windows = {}
 
     for record in records:
@@ -225,6 +264,9 @@ def split_subjects(samples, seed=SEED, ratios=(0.70, 0.15, 0.15),
     if abs(sum(ratios) - 1.0) > 1e-6:
         raise ValueError("Split ratios must sum to 1")
 
+    # One diagnosis per group. A patient with scans of both classes would make
+    # the stratified split ill-defined, so that case raises an error (the real
+    # data has no such patient).
     subject_labels = {}
 
     for record in samples:
@@ -238,11 +280,12 @@ def split_subjects(samples, seed=SEED, ratios=(0.70, 0.15, 0.15),
                 f"Subject {subject_id} has conflicting diagnosis labels"
             )
 
-    rng = random.Random(seed)
-    assignment = {}
+    rng = random.Random(seed)  # local generator: the split never touches global state
+    assignment = {}  # group id -> "train", "val" or "test"
 
     # Split each class independently to maintain approximate stratification.
     for label in sorted(set(subject_labels.values())):
+        # sort first so the shuffle depends only on the seed, not on file order
         subjects = sorted(
             subject_id
             for subject_id, subject_label in subject_labels.items()
@@ -258,6 +301,7 @@ def split_subjects(samples, seed=SEED, ratios=(0.70, 0.15, 0.15),
         if n_train + n_val > n_subjects:
             n_val = n_subjects - n_train
 
+        # first n_train groups -> train, next n_val -> val, the rest -> test
         for index, subject_id in enumerate(subjects):
             if index < n_train:
                 assignment[subject_id] = "train"
@@ -266,6 +310,7 @@ def split_subjects(samples, seed=SEED, ratios=(0.70, 0.15, 0.15),
             else:
                 assignment[subject_id] = "test"
 
+    # Every slice follows its group, so all slices of a patient stay together.
     splits = {"train": [], "val": [], "test": []}
 
     for record in samples:
@@ -282,6 +327,7 @@ def split_subjects(samples, seed=SEED, ratios=(0.70, 0.15, 0.15),
     assert subject_sets["train"].isdisjoint(subject_sets["test"])
     assert subject_sets["val"].isdisjoint(subject_sets["test"])
 
+    # For the leaky scan-level option, measure how many real patients are shared.
     if group_by != "subject_id":
         train_subjects = {r["subject_id"] for r in splits["train"]}
         for name in ("val", "test"):
@@ -307,6 +353,8 @@ def split_provided(samples, seed=SEED, val_fraction=0.15):
         raise ValueError("val_fraction must be in (0, 1)")
 
     def folder_of(record):
+        """Supplied folder ("train" or "test") that a slice came from."""
+        # path layout: .../AD_NC/<train|test>/<NC|AD>/<file>.jpeg
         return Path(record["path"]).parent.parent.name
 
     pool = [r for r in samples if folder_of(r) == "train"]
@@ -315,6 +363,8 @@ def split_provided(samples, seed=SEED, val_fraction=0.15):
     if not pool or not test:
         raise RuntimeError("Expected both a train and a test folder")
 
+    # Group by scan ID, as the supplied protocol does, and check that each scan
+    # has a single label.
     group_labels = {}
     for record in pool:
         previous = group_labels.setdefault(record["scan_id"], record["label"])
@@ -322,8 +372,9 @@ def split_provided(samples, seed=SEED, val_fraction=0.15):
             raise ValueError(f"Scan {record['scan_id']} has conflicting labels")
 
     rng = random.Random(seed)
-    val_groups = set()
+    val_groups = set()  # scans held out for validation
 
+    # Take val_fraction of the scans of each class (stratified by diagnosis)
     for label in sorted(set(group_labels.values())):
         groups = sorted(g for g, l in group_labels.items() if l == label)
         rng.shuffle(groups)
@@ -336,10 +387,12 @@ def split_provided(samples, seed=SEED, val_fraction=0.15):
         "test": test,
     }
 
+    # No scan may appear in two splits (patients still can; that is the leak).
     train_scans = {r["scan_id"] for r in splits["train"]}
     assert train_scans.isdisjoint({r["scan_id"] for r in splits["val"]})
     assert train_scans.isdisjoint({r["scan_id"] for r in splits["test"]})
 
+    # Measure the patient overlap using the patient IDs from the metadata
     train_subjects = {r["subject_id"] for r in splits["train"]}
     val_subjects = {r["subject_id"] for r in splits["val"]}
     test_subjects = {r["subject_id"] for r in splits["test"]}
@@ -355,6 +408,8 @@ def split_provided(samples, seed=SEED, val_fraction=0.15):
 def describe_splits(splits):
     """Print subject, scan, slice and class counts for each split."""
     for name, records in splits.items():
+        # dictionaries keyed by patient / scan remove duplicates, so len()
+        # counts distinct patients and distinct scans
         subjects = {
             record["subject_id"]: record["label"]
             for record in records
@@ -378,6 +433,8 @@ def describe_splits(splits):
             f"{len(scans)} scans, {len(records)} slices"
         )
 
+        # number of scans per (slice window, class), to show how the windows
+        # differ in class composition
         window_counts = Counter(
             (window, label)
             for label, window in scans.values()
@@ -401,6 +458,7 @@ def load_padded_image(path):
     The original 240 x 256 image is padded vertically with black pixels.
     """
     with Image.open(path) as image:
+        # convert("L") gives one grayscale channel; to_tensor scales to [0, 1]
         image_tensor = TF.to_tensor(image.convert("L"))
 
     _, height, width = image_tensor.shape
@@ -411,6 +469,8 @@ def load_padded_image(path):
             f"configured {IMAGE_SIZE} x {IMAGE_SIZE} canvas: {path}"
         )
 
+    # Centre the image on the canvas: split the missing pixels between the two
+    # sides (the extra pixel, if odd, goes to the right / bottom).
     pad_height = IMAGE_SIZE - height
     pad_width = IMAGE_SIZE - width
 
@@ -452,11 +512,14 @@ def compute_norm_stats(
     """
     stats_path = Path(stats_path)
 
+    # The resized images have different statistics, so they get their own file
     if mode == "stretch" and stats_path == STATS_PATH:
         stats_path = STATS_PATH.with_name(
             f"norm_stats_stretch{img_size}.json"
         )
 
+    # Fingerprint of the training set: a hash of the sorted file paths and labels.
+    # If the training records change, the hash changes and the cache is ignored.
     fingerprint_source = "\n".join(
         f"{record['path']}|{record['label']}"
         for record in sorted(
@@ -472,6 +535,9 @@ def compute_norm_stats(
         fingerprint_source.encode("utf-8")
     ).hexdigest()
 
+    # Reuse the cached values when they were computed for exactly this seed and
+    # training set; any problem reading the cache simply falls through to a
+    # fresh computation.
     if stats_path.is_file():
         try:
             with stats_path.open("r", encoding="utf-8") as file:
@@ -496,6 +562,9 @@ def compute_norm_stats(
     if not train_records:
         raise ValueError("Cannot calculate normalisation without training data")
 
+    # Streaming computation: accumulate the sum and the sum of squares over every
+    # pixel of every training image, so the images never have to fit in memory
+    # at once. Training images only: no validation or test pixel is used.
     total = 0.0
     total_squared = 0.0
     pixel_count = 0
@@ -506,7 +575,7 @@ def compute_norm_stats(
                 load_raw_image(record["path"]),
                 [img_size, img_size],
                 antialias=True,
-            ).double()
+            ).double()  # double precision keeps the large sums accurate
         else:
             image = load_padded_image(record["path"]).double()
 
@@ -514,6 +583,8 @@ def compute_norm_stats(
         total_squared += image.square().sum().item()
         pixel_count += image.numel()
 
+    # variance = E[x^2] - (E[x])^2; max() guards against a tiny negative value
+    # caused by rounding
     mean = total / pixel_count
     variance = max(total_squared / pixel_count - mean * mean, 0.0)
     std = variance ** 0.5
@@ -524,6 +595,8 @@ def compute_norm_stats(
             "check the image files and preprocessing."
         )
 
+    # Write to a temporary file and then rename it, so a job that is interrupted
+    # mid-write can never leave a half-written cache behind.
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = stats_path.with_suffix(".tmp")
 
@@ -550,10 +623,12 @@ class RandomGamma:
     """Apply a random gamma transformation to a grayscale tensor in [0, 1]."""
 
     def __init__(self, low, high):
+        """Gamma is drawn uniformly from [low, high] for every image."""
         self.low = low
         self.high = high
 
     def __call__(self, image):
+        """Return image ** gamma; gamma < 1 brightens, gamma > 1 darkens."""
         gamma = torch.empty(1).uniform_(
             self.low, self.high
         ).item()
@@ -579,13 +654,17 @@ def build_transforms(
     if img_size < 1:
         raise ValueError("img_size must be positive")
 
+    # Every image is first padded to the square canvas (a no-op if already square)
     steps = [transforms.Lambda(
         lambda image: _ensure_padded_size(image)
     )]
 
+    # Random augmentation is applied to training images only; validation and
+    # test images get the padding and normalisation and nothing else.
     if training:
         degrees, translation, scale, jitter, gamma, erase = AUGMENTATIONS[aug]
 
+        # random rotation, shift and zoom (empty corners are filled with black)
         steps.append(transforms.RandomAffine(
             degrees=degrees,
             translate=(translation, translation),
@@ -593,6 +672,7 @@ def build_transforms(
             fill=0,
         ))
 
+        # random brightness and contrast change
         steps.append(transforms.ColorJitter(
             brightness=jitter,
             contrast=jitter,
@@ -607,9 +687,11 @@ def build_transforms(
                 p=probability,
             ))
 
+        # optional random gamma change (strong presets only)
         if gamma is not None:
             steps.append(RandomGamma(*gamma))
 
+        # optional small random black rectangle (strong presets only)
         if erase > 0:
             steps.append(transforms.RandomErasing(
                 p=erase,
@@ -621,12 +703,14 @@ def build_transforms(
         if horizontal_flip:
             steps.append(transforms.RandomHorizontalFlip(p=0.5))
 
+    # Resize only when a size other than the 256 canvas is requested
     if img_size != IMAGE_SIZE:
         steps.append(transforms.Resize(
             (img_size, img_size),
             antialias=True,
         ))
 
+    # Standardise with the mean and standard deviation of the training images
     steps.append(transforms.Normalize([mean], [std]))
 
     return transforms.Compose(steps)
@@ -644,6 +728,7 @@ def build_stretch_transforms(training, mean, std, img_size=224):
         raise ValueError("img_size must be at least 32")
 
     if training:
+        # stretch to a slightly larger square (256 for a 224 target), then crop
         pre_size = round(img_size * 256 / 224)
 
         steps = [
@@ -664,6 +749,7 @@ def build_stretch_transforms(training, mean, std, img_size=224):
             transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
         ]
     else:
+        # evaluation: one deterministic resize, no crop or augmentation
         steps = [
             transforms.Resize((img_size, img_size), antialias=True),
         ]
@@ -702,14 +788,21 @@ class ADNISliceDataset(Dataset):
     """Dataset returning (image tensor, integer diagnosis label)."""
 
     def __init__(self, records, transform, loader=load_padded_image):
+        """
+        records:   list of slice records from collect_samples
+        transform: pipeline applied to every loaded image
+        loader:    function that reads an image file into a tensor
+        """
         self.records = records
         self.transform = transform
         self.loader = loader
 
     def __len__(self):
+        """Number of slices in this split."""
         return len(self.records)
 
     def __getitem__(self, index):
+        """Load one slice, transform it, and return (image, label)."""
         record = self.records[index]
         image = self.loader(record["path"])
         image = self.transform(image)
@@ -720,6 +813,8 @@ class ADNISliceDataset(Dataset):
 
 def _seed_worker(worker_id):
     """Seed Python and NumPy-compatible worker RNGs from PyTorch's seed."""
+    # Each loader worker process gets its own seed derived from PyTorch's, so
+    # augmentations differ between workers but repeat across runs.
     worker_seed = torch.initial_seed() % (2**32)
     random.seed(worker_seed)
 
@@ -745,6 +840,11 @@ def get_dataloaders(
     """
     Return a dictionary containing 'train', 'val' and 'test' DataLoaders.
 
+    split_mode  "subject" (patient-disjoint split) or "provided" (supplied
+                folders; train split into train and validation by scan)
+    aug         padded-pipeline preset ("mild", "strong", "strong_blur") or
+                "stretch_crop" for the resize-and-crop pipeline
+    img_size    side of the network input in pixels
     `subset` is intended only for smoke tests, not reported experiments.
     """
     if batch_size < 1:
@@ -753,6 +853,7 @@ def get_dataloaders(
     if num_workers < 0:
         raise ValueError("num_workers cannot be negative")
 
+    # read every slice record, then split them according to the chosen protocol
     samples = collect_samples(root)
     if split_mode == "subject":
         splits = split_subjects(samples, seed=seed)
@@ -779,6 +880,7 @@ def get_dataloaders(
         img_size=img_size,
     )
 
+    # Smoke-test mode: keep a small random sample of every split
     if subset is not None:
         if subset < 1:
             raise ValueError("subset must be positive when specified")
@@ -794,6 +896,7 @@ def get_dataloaders(
             "Use this only for smoke tests."
         )
 
+    # pinned memory speeds up host-to-GPU copies, so enable it when a GPU exists
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
 
@@ -802,6 +905,8 @@ def get_dataloaders(
     for split_name, records in splits.items():
         training = split_name == "train"
 
+        # choose the pipeline and the matching image reader: the resize-and-crop
+        # pipeline needs native-size images, the padded pipeline needs padded ones
         if stretch:
             transform = build_stretch_transforms(
                 training, mean, std, img_size
@@ -824,9 +929,13 @@ def get_dataloaders(
             loader=image_loader,
         )
 
+        # seeded generator so the shuffling order is reproducible
         generator = torch.Generator()
         generator.manual_seed(seed)
 
+        # Only the training loader shuffles. Validation and test loaders keep the
+        # file order, so their predictions line up with dataset.records. The last
+        # incomplete training batch is dropped to keep batch statistics stable.
         loaders[split_name] = DataLoader(
             dataset,
             batch_size=batch_size,

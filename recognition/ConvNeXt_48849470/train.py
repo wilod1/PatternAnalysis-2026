@@ -13,6 +13,24 @@ Training choices aimed at a small, subject-limited dataset:
     - exponential moving average (EMA) of the weights, used for validation
     - no weight decay on norm scales, biases or layer-scale parameters
     - a plain (unsmoothed) cross-entropy for validation and test loss
+
+The same script also trains the two baselines (--model cnn or --model resnet)
+with the same data pipeline and training loop, so models differ only in
+architecture. Settings are grouped into named recipes (--recipe): "default" and
+"resizecrop"; any flag given on the command line overrides the recipe.
+
+Usage (one Slurm job runs one command, see slurm/train.sh):
+    python train.py --recipe resizecrop --variant tiny --epochs 100 --split-mode provided --eval-test --run-name prov_rc
+    python train.py --model resnet --recipe resizecrop --epochs 100 --split-mode provided --eval-test --run-name prov_resnet
+    python train.py --variant tiny --run-name tiny_a
+    python train.py --help        lists every option
+
+Files written to --output-dir (default results/) for a run named RUN:
+    checkpoints/RUN_best.pt   weights of the best validation epoch
+    checkpoints/RUN_last.pt   state after the latest epoch (with optimiser)
+    RUN_history.json          configuration and per-epoch metrics
+    RUN_curves.png            training and validation curves
+    RUN_test_results.json     test metrics (only with --eval-test)
 """
 
 import argparse
@@ -36,6 +54,9 @@ from dataset import AUG_CHOICES, get_dataloaders
 from modules import CONVNEXT_VARIANTS, ConvNeXt, SimpleCNN, SimpleResNet
 
 # Named bundles of defaults. Any flag given on the command line still wins.
+# "default" is empty: it uses the defaults of the command-line flags themselves
+# (see parse_args), which are the padded 256 pixel pipeline with strong
+# augmentation, EMA, gradient clipping, dropout and early stopping.
 RECIPES = {
     "default": {},
     # Resize-and-crop pipeline with a plain AdamW schedule: no EMA, no
@@ -68,13 +89,17 @@ RECIPES = {
 
 def set_seed(seed, deterministic=False):
     """Seed all generators. cuDNN autotuning is on unless deterministic."""
+    # Python, NumPy (also used for the mixup weights) and PyTorch each keep
+    # their own random generator, so all three are seeded
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(seed)  # every GPU
 
+    # Deterministic mode is slower but makes repeated runs much closer;
+    # autotuning (benchmark) picks the fastest algorithm and can vary between runs.
     torch.backends.cudnn.deterministic = deterministic
     torch.backends.cudnn.benchmark = not deterministic
 
@@ -92,17 +117,22 @@ class ModelEMA:
     """
 
     def __init__(self, model, decay):
+        """Start the average as a frozen copy of the model; decay is the final rate."""
+        # a separate copy holds the averaged weights; it is never trained
         self.module = copy.deepcopy(model).eval()
 
         for parameter in self.module.parameters():
             parameter.requires_grad_(False)
 
         self.decay = decay
-        self.updates = 0
+        self.updates = 0  # number of optimiser steps seen so far
 
     @torch.no_grad()
     def update(self, model):
+        """Move the averaged weights a small step towards the current weights."""
         self.updates += 1
+        # The decay starts small, so the average follows the model closely at the
+        # beginning, and grows towards its final value (e.g. 0.999) as training goes on.
         decay = min(self.decay, (1 + self.updates) / (10 + self.updates))
 
         source = model.state_dict().values()
@@ -110,8 +140,10 @@ class ModelEMA:
 
         for ema_value, value in zip(target, source):
             if ema_value.dtype.is_floating_point:
+                # average = decay * average + (1 - decay) * current weight
                 ema_value.mul_(decay).add_(value.detach(), alpha=1.0 - decay)
             else:
+                # integer entries (such as batch-norm counters) are copied as they are
                 ema_value.copy_(value)
 
 
@@ -124,6 +156,7 @@ def build_optimizer(model, lr, weight_decay, decay_all=False):
     AdamW. By default weight decay skips norm scales, biases and
     layer-scale vectors; decay_all applies it to every parameter.
     """
+    # one parameter group: weight decay on everything that is trained
     if decay_all:
         return torch.optim.AdamW(
             [p for p in model.parameters() if p.requires_grad],
@@ -131,6 +164,8 @@ def build_optimizer(model, lr, weight_decay, decay_all=False):
             weight_decay=weight_decay,
         )
 
+    # two parameter groups: weights that are decayed, and one-dimensional
+    # parameters that are not
     decay, no_decay = [], []
 
     for parameter in model.parameters():
@@ -155,10 +190,13 @@ def learning_rate_at_step(step, total_steps, warmup_steps, base_lr, min_lr):
 
     The first training step starts at 10% of the base learning rate.
     """
+    # warm-up: rise linearly from 10% of the base rate to the full base rate
     if warmup_steps > 0 and step < warmup_steps:
         warmup_fraction = step / warmup_steps
         return base_lr * (0.1 + 0.9 * warmup_fraction)
 
+    # cosine decay: progress runs from 0 to 1 over the remaining steps, and the
+    # rate falls smoothly from base_lr to min_lr
     decay_steps = max(total_steps - warmup_steps, 1)
     decay_step = max(step - warmup_steps, 0)
     progress = min(decay_step / decay_steps, 1.0)
@@ -198,14 +236,15 @@ def train_one_epoch(
     With fixed_lr set, that learning rate is used for the whole epoch;
     otherwise the schedule is evaluated at every optimiser step.
     """
-    model.train()
+    model.train()  # enables dropout, stochastic depth and batch-norm updates
 
-    loss_sum = 0.0
+    loss_sum = 0.0  # running totals, weighted by batch size
     correct = 0
     samples = 0
     lr = args.lr
 
     for images, labels in loader:
+        # choose the learning rate for this step
         if fixed_lr is not None:
             lr = fixed_lr
         else:
@@ -223,6 +262,7 @@ def train_one_epoch(
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
+        # clear the gradients left by the previous step
         optimizer.zero_grad(set_to_none=True)
 
         # Mixup: blend each image with a shuffled partner from the same batch.
@@ -236,6 +276,7 @@ def train_one_epoch(
             images = mix_lambda * images + (1.0 - mix_lambda) * images[permutation]
             mix_labels = labels[permutation]
 
+        # forward pass in mixed precision (half precision where it is safe)
         with torch.autocast(
             device_type=device.type,
             dtype=torch.float16,
@@ -250,6 +291,9 @@ def train_one_epoch(
                     + (1.0 - mix_lambda) * criterion(logits, mix_labels)
                 )
 
+        # Backward pass and optimiser step. With mixed precision the loss is
+        # scaled up to avoid tiny gradients vanishing, and the gradients are
+        # unscaled again before clipping so the clip threshold is meaningful.
         if scaler.is_enabled():
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -271,9 +315,11 @@ def train_one_epoch(
 
             optimizer.step()
 
+        # update the averaged weights after every optimiser step
         if ema is not None:
             ema.update(model)
 
+        # bookkeeping for the epoch metrics
         batch_size = labels.size(0)
         loss_sum += loss.detach().item() * batch_size
         dominant = labels if mix_labels is None or mix_lambda >= 0.5 else mix_labels
@@ -289,6 +335,9 @@ def train_one_epoch(
     return metrics, global_step, lr
 
 
+# --select-metric choices -> key in the validation metrics dictionary.
+# slice_acc (per-slice accuracy) is the default; the patient_* choices use the
+# patient-level metrics of patient_metrics().
 SELECT_METRICS = {
     "slice_acc": "accuracy",
     "patient_acc": "patient_accuracy",
@@ -303,6 +352,8 @@ def rank_auc(scores, labels):
     negatives = scores[labels == 0]
     if len(positives) == 0 or len(negatives) == 0:
         return 0.5
+    # AUC = probability that a random positive scores higher than a random
+    # negative, estimated by comparing every positive with every negative
     greater = (positives[:, None] > negatives[None, :]).mean()
     ties = (positives[:, None] == negatives[None, :]).mean()
     return float(greater + 0.5 * ties)
@@ -316,13 +367,16 @@ def patient_metrics(probs, labels, subject_ids):
     (every scan); the patient is called AD when the mean P(AD) exceeds 0.5,
     which is the same as argmax of the averaged probabilities.
     """
+    # inverse[i] is the patient number (0 .. n_patients-1) of slice i
     _, inverse = np.unique(subject_ids, return_inverse=True)
     n_patients = inverse.max() + 1
 
+    # slices per patient, and the mean of P(AD) over those slices
     counts = np.bincount(inverse, minlength=n_patients).astype(float)
     mean_p_ad = np.bincount(
         inverse, weights=probs[:, 1], minlength=n_patients
     ) / counts
+    # every slice of a patient has the same diagnosis, so any slice gives it
     patient_labels = np.zeros(n_patients, dtype=int)
     patient_labels[inverse] = labels
 
@@ -331,6 +385,8 @@ def patient_metrics(probs, labels, subject_ids):
     nc = patient_labels == 0
     ad = patient_labels == 1
 
+    # balanced accuracy is the mean of the recall for NC and the recall for AD,
+    # which matters because patients are about two to one NC to AD
     return {
         "patient_accuracy": float(correct.mean()),
         "patient_balanced_accuracy": float(
@@ -350,7 +406,7 @@ def evaluate(model, loader, criterion, device, amp_enabled,
     With with_patient=True the loader must be unshuffled so rows line up with
     loader.dataset.records, and patient-level metrics are added.
     """
-    model.eval()
+    model.eval()  # no dropout or stochastic depth when evaluating
 
     loss_sum = 0.0
     correct = 0
@@ -358,6 +414,7 @@ def evaluate(model, loader, criterion, device, amp_enabled,
     all_probs = []
     all_labels = []
 
+    # patient metrics need each row to match its record, so the order must be fixed
     if with_patient and isinstance(loader.sampler, RandomSampler):
         raise ValueError("Patient-level evaluation needs an unshuffled loader")
 
@@ -378,6 +435,7 @@ def evaluate(model, loader, criterion, device, amp_enabled,
         correct += count_correct(logits, labels)
         samples += batch_size
 
+        # keep the probabilities (in full precision) for the patient-level step
         if with_patient:
             all_probs.append(torch.softmax(logits.float(), dim=1).cpu())
             all_labels.append(labels.cpu())
@@ -391,6 +449,7 @@ def evaluate(model, loader, criterion, device, amp_enabled,
         "samples": samples,
     }
 
+    # attach patient-level metrics, using the patient ID of each record
     if with_patient:
         records = loader.dataset.records
         if len(records) != samples:
@@ -435,6 +494,8 @@ def save_checkpoint(
     """
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # model_name and model_config let utils.py and the analysis scripts rebuild
+    # the exact architecture; training_config records every setting of the run.
     payload = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
@@ -445,6 +506,8 @@ def save_checkpoint(
         "training_config": config_dict(args),
     }
 
+    # the optimiser state is only stored with the "last" checkpoint, so that an
+    # interrupted run could be resumed or inspected
     if optimizer is not None:
         payload["optimizer_state_dict"] = optimizer.state_dict()
 
@@ -467,6 +530,7 @@ def save_curves(history, path):
     """Plot train and validation loss and accuracy to one PNG."""
     epochs = [entry["epoch"] for entry in history]
 
+    # left panel: loss, right panel: accuracy
     figure, (loss_axis, accuracy_axis) = plt.subplots(
         1, 2, figsize=(10, 3.6)
     )
@@ -482,6 +546,7 @@ def save_curves(history, path):
     accuracy_axis.plot(
         epochs, [e["val_accuracy"] for e in history], label="validation"
     )
+    # patient-level validation accuracy is drawn too when it was recorded
     if all("val_patient_accuracy" in e for e in history):
         accuracy_axis.plot(
             epochs, [e["val_patient_accuracy"] for e in history],
@@ -502,6 +567,12 @@ def save_curves(history, path):
 # ---------------------------------------------------------------------
 
 def parse_args(argv=None):
+    """
+    Read the command line (or the list argv) and return the validated settings.
+
+    The recipe is read first, because its values replace the built-in defaults;
+    any option given explicitly on the command line then overrides the recipe.
+    """
     # First pass: find the recipe so its values can become the defaults.
     recipe_parser = argparse.ArgumentParser(add_help=False)
     recipe_parser.add_argument(
@@ -517,7 +588,8 @@ def parse_args(argv=None):
         help="Named bundle of defaults; explicit flags override it.",
     )
 
-    # Data
+    # Data: batch size, input size, seed, loading workers, augmentation preset,
+    # and which evaluation protocol (patient-disjoint split or provided folders)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--img-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
@@ -531,7 +603,7 @@ def parse_args(argv=None):
              "filename number (comparison only; patients can leak).",
     )
 
-    # Model
+    # Model: which architecture, and for ConvNeXt its size and regularisation
     parser.add_argument(
         "--model", choices=["convnext", "cnn", "resnet"], default="convnext",
         help="Architecture. cnn and resnet are the SimpleCNN and SimpleResNet "
@@ -546,7 +618,8 @@ def parse_args(argv=None):
     parser.add_argument("--drop-path", type=float, default=0.2)
     parser.add_argument("--dropout", type=float, default=0.3)
 
-    # Optimisation
+    # Optimisation: length, early stopping, checkpoint selection, learning rate
+    # schedule, regularisation and mixed-precision options
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=30)
     parser.add_argument(
@@ -578,7 +651,7 @@ def parse_args(argv=None):
         help="Evaluate the learning-rate schedule per step or per epoch.",
     )
 
-    # Runtime and output
+    # Runtime and output: run name, output folder, precision and reproducibility
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
     parser.add_argument("--no-amp", action="store_true")
@@ -589,9 +662,11 @@ def parse_args(argv=None):
         help="Evaluate the held-out test set once after training finishes.",
     )
 
+    # the chosen recipe overrides the defaults above; explicit flags still win
     parser.set_defaults(**RECIPES[known.recipe])
     args = parser.parse_args(argv)
 
+    # Reject impossible values early, before any data is loaded
     if args.batch_size < 1:
         parser.error("--batch-size must be positive")
     if args.epochs < 1:
@@ -640,16 +715,25 @@ def resolve_architecture(args):
 # ---------------------------------------------------------------------
 
 def main(argv=None):
+    """
+    Train one model and, if --eval-test is given, evaluate it once on the test set.
+
+    Steps: read the settings, build the data loaders and the model, train with
+    validation after every epoch (keeping the best checkpoint), restore the best
+    weights, and finally write the history, curves and optional test results.
+    """
     args = parse_args(argv)
     set_seed(args.seed, deterministic=args.deterministic)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # mixed precision only makes sense on a GPU
     amp_enabled = device.type == "cuda" and not args.no_amp
 
     if args.model == "convnext":
         depths, dims, arch_label = resolve_architecture(args)
     else:
         depths, dims, arch_label = None, None, args.model
+    # name used for every output file; defaults to the variant or model name
     run = args.run_name or arch_label
 
     cpus = (
@@ -658,6 +742,7 @@ def main(argv=None):
         else os.cpu_count()
     )
 
+    # Print every setting at the top of the log, so each run is self-describing
     print("=" * 65)
     print(f"ADNI MRI Classification - {args.model} ({arch_label})")
     print("=" * 65)
@@ -682,7 +767,7 @@ def main(argv=None):
     print(f"Test evaluation: {args.eval_test}")
     print("=" * 65)
 
-    # The dataset module creates the subject-level splits.
+    # The dataset module creates the splits (patient-disjoint or provided).
     loaders = get_dataloaders(
         batch_size=args.batch_size,
         img_size=args.img_size,
@@ -703,6 +788,8 @@ def main(argv=None):
     print(f"Validation batches: {len(val_loader)}")
     print(f"Test batches:       {len(test_loader)}")
 
+    # Build the model. model_config is stored in every checkpoint so the same
+    # architecture can be rebuilt later without the command line.
     if args.model == "convnext":
         model_name = "ConvNeXt"
         model_config = {
@@ -726,11 +813,14 @@ def main(argv=None):
     parameter_count = sum(p.numel() for p in model.parameters())
     print(f"\nModel parameters: {parameter_count:,}")
 
+    # EMA is switched off by setting its decay to 0 (the resizecrop recipe does)
     ema = ModelEMA(model, args.ema_decay) if args.ema_decay > 0 else None
 
     # Weights that get validated, checkpointed and finally tested.
     eval_model = ema.module if ema is not None else model
 
+    # Label smoothing softens the training targets; validation and test use the
+    # plain loss, so reported losses are comparable between runs.
     train_criterion = nn.CrossEntropyLoss(
         label_smoothing=args.label_smoothing
     )
@@ -741,12 +831,15 @@ def main(argv=None):
     )
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
+    # schedule length in optimiser steps; warm-up is capped so that at least one
+    # step remains for the decay
     total_steps = args.epochs * len(train_loader)
     warmup_steps = min(
         int(args.warmup_epochs * len(train_loader)),
         max(total_steps - 1, 0),
     )
 
+    # output locations (see the module docstring for what each file holds)
     output_dir = args.output_dir
     checkpoint_dir = output_dir / "checkpoints"
     best_path = checkpoint_dir / f"{run}_best.pt"
@@ -757,6 +850,7 @@ def main(argv=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # progress tracking: per-epoch history and the best result so far
     history = []
     best_score = -1.0
     best_val_accuracy = -1.0
@@ -770,6 +864,8 @@ def main(argv=None):
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
 
+        # With lr_unit "epoch" the learning rate is computed once per epoch and
+        # held fixed during it; with "step" it is updated at every optimiser step.
         epoch_lr = None
 
         if args.lr_unit == "epoch":
@@ -797,11 +893,12 @@ def main(argv=None):
             fixed_lr=epoch_lr,
         )
 
-        # Validation never updates weights.
+        # Validation never updates weights. It uses the EMA weights when EMA is on.
         val_metrics = evaluate(
             eval_model, val_loader, eval_criterion, device, amp_enabled,
             with_patient=True,
         )
+        # the metric that decides which epoch is "best" (per-slice accuracy by default)
         score = val_metrics[SELECT_METRICS[args.select_metric]]
 
         epoch_seconds = time.time() - epoch_start
@@ -832,6 +929,7 @@ def main(argv=None):
             flush=True,
         )
 
+        # Better score wins; on an exact tie the lower validation loss wins.
         improved = (
             score > best_score
             or (score == best_score and val_metrics["loss"] < best_val_loss)
@@ -861,9 +959,12 @@ def main(argv=None):
             optimizer=optimizer, model_name=model_name,
         )
 
+        # rewrite the history and the curves every epoch, so they are available
+        # even if the job is stopped early
         write_history(history_path, history, args)
         save_curves(history, curves_path)
 
+        # early stopping (the resizecrop recipe sets a huge patience, disabling it)
         if epochs_without_improvement >= args.patience:
             print(
                 f"\nEarly stopping: no improvement for "
@@ -875,6 +976,8 @@ def main(argv=None):
     if not best_path.is_file():
         raise RuntimeError("No best-model checkpoint was saved.")
 
+    # weights_only=False because the checkpoint also holds plain Python
+    # settings; very old PyTorch versions lack the argument, hence the fallback
     try:
         checkpoint = torch.load(
             best_path, map_location=device, weights_only=False
@@ -886,6 +989,7 @@ def main(argv=None):
 
     elapsed_minutes = (time.time() - start_time) / 60.0
 
+    # summary of the finished run
     print("\n" + "=" * 65)
     print("Training finished")
     print("=" * 65)
@@ -906,6 +1010,7 @@ def main(argv=None):
                 "Rerun without --subset for a proper final evaluation."
             )
 
+        # one evaluation, with the best-validation weights restored above
         test_metrics = evaluate(
             eval_model, test_loader, eval_criterion, device, amp_enabled
         )
