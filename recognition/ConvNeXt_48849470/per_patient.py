@@ -6,7 +6,7 @@ Usage (on Rangpur, inside the torch env, from the repo folder):
     python per_patient.py results/checkpoints/mini_a_best.pt --split val
 
 Predictions are exported to results/preds/<run>.npz. Defaults to the VALIDATION
-split; use --split test only once, after the metric choice is written in the README.
+split.
 Patient score = mean of the slice probabilities over every slice of that subject.
 """
 import argparse
